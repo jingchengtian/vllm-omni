@@ -1758,7 +1758,10 @@ class MossTTSLocalTalkerForGeneration(nn.Module):
         )  # (n_vq, audio_vocab_size, hidden_size)
 
         if not self.vllm_config.model_config.enforce_eager:
-            self.local_transformer.setup_compile()
+            self.local_transformer.setup_compile(
+                self.n_vq,
+                self.vllm_config.scheduler_config.max_num_seqs,
+            )
 
         logger.info(
             "[MossTTSLocal] loaded %d/%d params; skipped=%d (first 5: %s)",
