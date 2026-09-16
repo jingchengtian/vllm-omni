@@ -839,10 +839,17 @@ class MossAudioTokenizerMultiheadAttention(StreamingModule):
             and q.shape[-1] == 64
         ):
             x = streaming_attention(q, k, v, attn_bias)
-        elif q.device.type == "npu" and attn_bias is not None:
+        elif q.device.type == "npu":
             import torch_npu
 
-            atten_mask = ~attn_bias
+            if attn_bias is not None:
+                atten_mask = ~attn_bias
+                pre_tockens = attn_bias.shape[-1]
+                next_tockens = 0
+            else:
+                atten_mask = None
+                pre_tockens = T
+                next_tockens = T
             x, _, _, _, _, _, _ = torch_npu.npu_fusion_attention(
                 q,
                 k,
@@ -852,24 +859,8 @@ class MossAudioTokenizerMultiheadAttention(StreamingModule):
                 atten_mask=atten_mask,
                 scale=1.0 / (self.embed_dim // self.num_heads) ** 0.5,
                 keep_prob=1.0,
-                pre_tockens=attn_bias.shape[-1],
-                next_tockens=0,
-                sparse_mode=0,
-            )
-        elif q.device.type == "npu" and attn_bias is None:
-            import torch_npu
-
-            x, _, _, _, _, _, _ = torch_npu.npu_fusion_attention(
-                q,
-                k,
-                v,
-                head_num=self.num_heads,
-                input_layout="BNSD",
-                atten_mask=None,
-                scale=1.0 / (self.embed_dim // self.num_heads) ** 0.5,
-                keep_prob=1.0,
-                pre_tockens=T,
-                next_tockens=T,
+                pre_tockens=pre_tockens,
+                next_tockens=next_tockens,
                 sparse_mode=0,
             )
         else:
