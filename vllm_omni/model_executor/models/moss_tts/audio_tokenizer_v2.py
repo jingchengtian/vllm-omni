@@ -531,7 +531,7 @@ class RingKVCache:
     @staticmethod
     def _compute_positions(
         end_offset: torch.Tensor,
-        T: int,
+        step: int,
         capacity: int,
         valid_rows: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -543,7 +543,7 @@ class RingKVCache:
         Invalid slots (cache index >= next_offset) get position ``-1``.
         """
         cache_indexes = torch.arange(capacity, device=end_offset.device, dtype=torch.long)
-        last_offset = end_offset.view(-1, 1) + T - 1
+        last_offset = end_offset.view(-1, 1) + step - 1
         end_index = last_offset % capacity
         delta = cache_indexes - end_index
         positions = torch.where(
@@ -551,7 +551,7 @@ class RingKVCache:
             last_offset + delta,
             last_offset + delta - capacity,
         )
-        next_offset = torch.where(valid_rows, end_offset + T, end_offset)
+        next_offset = torch.where(valid_rows, end_offset + step, end_offset)
         invalid = cache_indexes >= next_offset.view(-1, 1)
         positions = torch.where(invalid, torch.full_like(positions, -1), positions)
         return positions, next_offset
@@ -590,9 +590,7 @@ class RingKVCache:
                 keys.scatter_(2, scatter_indexes, k)
                 values.scatter_(2, scatter_indexes, v)
 
-                positions, next_offset = self._compute_positions(
-                    end_offset, T, self.capacity, valid_rows
-                )
+                positions, next_offset = self._compute_positions(end_offset, T, self.capacity, valid_rows)
                 self.end_offset[slot0 : slot0 + 1] = next_offset
                 return KVCacheResult(keys, values, positions)
 
@@ -609,9 +607,7 @@ class RingKVCache:
             # request even though dense graph operators still execute it.
             self.cache.index_copy_(1, slots, row_cache)
 
-            positions, next_offset = self._compute_positions(
-                end_offset, T, self.capacity, valid_rows
-            )
+            positions, next_offset = self._compute_positions(end_offset, T, self.capacity, valid_rows)
             self.end_offset.index_copy_(0, slots, next_offset)
             return KVCacheResult(row_cache[0], row_cache[1], positions)
 
