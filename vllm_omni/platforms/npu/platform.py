@@ -294,7 +294,14 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
 
     @classmethod
     def supports_talker_mtp_graph_capture(cls) -> bool:
-        """NPU cannot capture the talker MTP Python sampling loop via ACLGraph."""
+        """NPU cannot capture the talker MTP Python sampling loop via ACLGraph.
+
+        Returns False so that all models using this gate (MOSS-TTS via
+        ``talker_mtp_graph_safe`` and Qwen3-Omni via
+        ``supports_talker_mtp_graph_capture()``) disable talker MTP graph
+        capture on NPU.  This supersedes the per-model workaround in the
+        310P Qwen3-TTS patch (``self.talker_mtp_graph_safe = False``).
+        """
         return False
 
     @classmethod

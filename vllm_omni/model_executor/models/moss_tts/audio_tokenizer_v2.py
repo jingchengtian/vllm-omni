@@ -528,6 +528,34 @@ class RingKVCache:
         slots = state_slot_ids.to(device=self.end_offset.device, dtype=torch.long)
         self.end_offset.index_fill_(0, slots, 0)
 
+    @staticmethod
+    def _compute_positions(
+        end_offset: torch.Tensor,
+        T: int,
+        capacity: int,
+        valid_rows: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Compute KV positions and next end_offset for a streaming step.
+
+        Shared by the B==1 slice path and the general gather path in
+        ``complete``.  Returns ``(positions, next_offset)`` where positions
+        has shape ``(B, capacity)`` and next_offset has shape ``(B,)``.
+        Invalid slots (cache index >= next_offset) get position ``-1``.
+        """
+        cache_indexes = torch.arange(capacity, device=end_offset.device, dtype=torch.long)
+        last_offset = end_offset.view(-1, 1) + T - 1
+        end_index = last_offset % capacity
+        delta = cache_indexes - end_index
+        positions = torch.where(
+            delta <= 0,
+            last_offset + delta,
+            last_offset + delta - capacity,
+        )
+        next_offset = torch.where(valid_rows, end_offset + T, end_offset)
+        invalid = cache_indexes >= next_offset.view(-1, 1)
+        positions = torch.where(invalid, torch.full_like(positions, -1), positions)
+        return positions, next_offset
+
     def complete(
         self,
         k: torch.Tensor,
@@ -562,19 +590,10 @@ class RingKVCache:
                 keys.scatter_(2, scatter_indexes, k)
                 values.scatter_(2, scatter_indexes, v)
 
-                cache_indexes = torch.arange(self.capacity, device=end_offset.device, dtype=torch.long)
-                last_offset = end_offset.view(-1, 1) + T - 1
-                end_index = last_offset % self.capacity
-                delta = cache_indexes - end_index
-                positions = torch.where(
-                    delta <= 0,
-                    last_offset + delta,
-                    last_offset + delta - self.capacity,
+                positions, next_offset = self._compute_positions(
+                    end_offset, T, self.capacity, valid_rows
                 )
-                next_offset = torch.where(valid_rows, end_offset + T, end_offset)
                 self.end_offset[slot0 : slot0 + 1] = next_offset
-                invalid = cache_indexes >= next_offset.view(-1, 1)
-                positions = torch.where(invalid, torch.full_like(positions, -1), positions)
                 return KVCacheResult(keys, values, positions)
 
             end_offset = self.end_offset.index_select(0, slots)
@@ -590,19 +609,10 @@ class RingKVCache:
             # request even though dense graph operators still execute it.
             self.cache.index_copy_(1, slots, row_cache)
 
-            cache_indexes = torch.arange(self.capacity, device=end_offset.device, dtype=torch.long)
-            last_offset = end_offset.view(-1, 1) + T - 1
-            end_index = last_offset % self.capacity
-            delta = cache_indexes - end_index
-            positions = torch.where(
-                delta <= 0,
-                last_offset + delta,
-                last_offset + delta - self.capacity,
+            positions, next_offset = self._compute_positions(
+                end_offset, T, self.capacity, valid_rows
             )
-            next_offset = torch.where(valid_rows, end_offset + T, end_offset)
             self.end_offset.index_copy_(0, slots, next_offset)
-            invalid = cache_indexes >= next_offset.view(-1, 1)
-            positions = torch.where(invalid, torch.full_like(positions, -1), positions)
             return KVCacheResult(row_cache[0], row_cache[1], positions)
 
         indexes = torch.arange(T, device=self.end_offset.device, dtype=self.end_offset.dtype)
