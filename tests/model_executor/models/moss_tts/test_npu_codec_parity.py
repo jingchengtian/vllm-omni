@@ -74,7 +74,9 @@ def test_npu_fusion_attention_with_mask_matches_sdpa(batch, heads, q_len, kv_len
         atten_mask = ~attn_bias  # NPU: True = masked (inverted)
         scale = 1.0 / 64**0.5
         x_npu, _, _, _, _, _, _ = torch_npu.npu_fusion_attention(
-            q, k, v,
+            q,
+            k,
+            v,
             head_num=heads,
             input_layout="BNSD",
             atten_mask=atten_mask,
@@ -112,7 +114,9 @@ def test_npu_fusion_attention_no_mask_matches_sdpa(batch, heads, q_len, device):
 
         scale = 1.0 / 64**0.5
         x_npu, _, _, _, _, _, _ = torch_npu.npu_fusion_attention(
-            q, k, v,
+            q,
+            k,
+            v,
             head_num=heads,
             input_layout="BNSD",
             atten_mask=None,
@@ -156,8 +160,12 @@ def test_attention_forward_npu_branch_matches_sdpa_fallback(device):
             result_npu = attn(x, x, x)
             # Reference: temporarily force the SDPA fallback by moving to CPU
             attn_cpu = MossAudioTokenizerMultiheadAttention(
-                embed_dim, num_heads, causal=True, context=9,
-                device="cpu", dtype=dtype,
+                embed_dim,
+                num_heads,
+                causal=True,
+                context=9,
+                device="cpu",
+                dtype=dtype,
             ).eval()
             attn_cpu.load_state_dict(attn.state_dict())
             x_cpu = x.cpu()
@@ -316,8 +324,6 @@ def test_rope_npu_neox_path_matches_eager_interleaved(device):
     offset = torch.tensor([3, 5], device=dev, dtype=torch.long)
 
     if device == "npu":
-        import torch_npu
-
         # NPU path (with freqs_cache as in production)
         rope = MossAudioTokenizerRotaryEmbedding(max_period=10000.0)
         freqs = rope._get_freqs(D, dev)
@@ -342,9 +348,9 @@ def test_rope_npu_neox_path_matches_eager_interleaved(device):
         # Verify QK^T parity (layout independence)
         # NPU QK^T (neox layout) — bf16 accumulation differs slightly between
         # layouts due to summation order, so use a modest tolerance.
-        qkt_npu = (q_npu.float() @ k_npu.float().transpose(-1, -2))
+        qkt_npu = q_npu.float() @ k_npu.float().transpose(-1, -2)
         # Eager QK^T (interleaved layout)
-        qkt_ref = (q_ref.float() @ k_ref.float().transpose(-1, -2))
+        qkt_ref = q_ref.float() @ k_ref.float().transpose(-1, -2)
         torch.testing.assert_close(qkt_npu.cpu(), qkt_ref, atol=0.1, rtol=0.1)
     else:
         # CPU: just verify eager path runs
