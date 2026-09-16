@@ -192,7 +192,7 @@ def test_ring_kv_cache_wraparound_positions(device):
 
     k1 = torch.randn(B, H, T, D, device=dev, dtype=dtype)
     v1 = torch.randn_like(k1)
-    result1 = cache.complete(k1, v1, exec_mask=torch.ones(B, dtype=torch.bool, device=dev))
+    cache.complete(k1, v1, exec_mask=torch.ones(B, dtype=torch.bool, device=dev))
 
     # After step 1: end_offset = 5 for both batches
     assert cache.end_offset.tolist() == [T, T]
