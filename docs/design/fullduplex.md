@@ -108,18 +108,17 @@ plugin and the session runtime config to `DuplexOrchestrator` directly.
    `AsyncOmniEngine`, `OrchestratorBase` and `Orchestrator` carry only
    template seams; `tests/engine/test_duplex_import_boundary.py` checks that
    importing the turn-based stack loads no duplex module.
-4. **Every surface a duplex server exposes is backed by a session.**
+4. **Deployment selects the serving stack.**
    `vllm-omni serve` constructs `DuplexOmni` when the pipeline declares
-   `duplex_plugin`; the server exposes `/v1/realtime?duplex=1` (alias
+   `duplex_plugin` and the deploy configuration sets `session_mode: duplex`.
+   An explicit `session_mode: turn` selects `AsyncOmni` instead, without
+   changing the pipeline's duplex capability. In duplex mode the server exposes `/v1/realtime?duplex=1` (alias
    `/v1/duplex`), `POST /v1/chat/completions`, `/v1/models` and `/health`, and
-   every other turn-based route reports "not available". The chat route is
-   served by `DuplexChatCompletionsAdapter`, a Realtime client that runs one
-   short-lived session per request: speech becomes a committed turn, text is
-   seeded as the session's opening turn because a model-native model takes a
-   turn only when it hears speech. Whether a model can be reached with text is
-   `DuplexCapabilities.supports_chat_completions`; one that cannot is refused
-   at once rather than left to idle out. Turn-based use of the same model stays
-   available offline through `Omni` / `AsyncOmni`.
+   every other turn-based route reports "not available". The chat route uses
+   the ordinary chat service on the duplex engine, without a session, when
+   the plugin declares `DuplexCapabilities.supports_chat_completions`.
+   Turn-based deployments use the ordinary API initialization and retain
+   model capability checks and endpoint restrictions.
 5. **Serving is transport only.** The websocket handler does socket I/O,
    wire-envelope validation, command translation, event rendering and the
    attachment/resume/replay bookkeeping; it holds no session state.
