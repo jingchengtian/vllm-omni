@@ -1,6 +1,6 @@
 # MOSS-TTS-Local-Transformer-v1.5 2-NPU deploy: Stage0 talker on NPU 0, Stage1 codec on NPU 1.
 # Splits AR (talker+depth) and codec across devices to remove AR/codec contention.
-# Launch: ASCEND_RT_VISIBLE_DEVICES=5,6 vllm-omni serve ... --deploy-config this.yaml
+# Launch: vllm-omni serve ... --deploy-config moss_tts_local_2npu.yaml
 async_chunk: true
 
 connectors:
