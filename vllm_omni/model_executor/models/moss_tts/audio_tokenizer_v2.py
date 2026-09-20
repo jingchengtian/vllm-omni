@@ -310,9 +310,16 @@ def apply_rope(
     instead of the manual 14-op eager rotation. The codec's GPT-J convention
     (even/odd index pairs) is mathematically identical to the neox convention
     after a layout conversion: interleaved ``[r0 i0 r1 i1 ...]`` -> neox
-    ``[r0 r1 ... i0 i1 ...]``, apply ``npu_rotary_mul``, convert back. This
-    fuses the 6 mul/add ops into 1 kernel. Result is bf16-identical
-    (max_abs_diff = 1 ULP). Falls back to the eager path on non-NPU.
+    ``[r0 r1 ... i0 i1 ...]``, apply ``npu_rotary_mul``.
+
+    **Layout contract**: the NPU path skips the neox→interleaved back-
+    conversion, so it returns Q/K in **neox** layout, while the non-NPU path
+    returns Q/K in **interleaved** (GPT-J) layout.  This is safe because
+    attention's QK^T dot product is invariant to a shared permutation of the
+    D dimension, and both Q and K are in the same layout.  However, the
+    returned tensors are **not** interchangeable between the two paths — callers
+    must not mix NPU and non-NPU outputs.  Result is bf16-equivalent (max
+    ``max_abs_diff <= 1 ULP``).  Falls back to the eager path on non-NPU.
     """
     if time_before_heads:
         B, T, H, D = q.shape
@@ -529,14 +536,19 @@ class RingKVCache:
         else:
             self.end_offset = torch.zeros(1, device=device, dtype=torch.long)
         self._arange_capacity = torch.arange(capacity, device=device, dtype=torch.long)
-        self._cached_T: int = -1
-        self._arange_T: torch.Tensor | None = None
 
     def _get_arange_t(self, t_len: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
-        if self._cached_T != t_len or self._arange_T is None or self._arange_T.device != device:
-            self._arange_T = torch.arange(t_len, device=device, dtype=dtype)
-            self._cached_T = t_len
-        return self._arange_T
+        """Return ``torch.arange(t_len)`` reusing the object-lifetime ``_arange_capacity``.
+
+        ``_arange_capacity`` is allocated once in ``__init__`` and lives for the
+        object's lifetime, so sliced views are safe inside captured CUDA graphs
+        (the underlying storage is never freed).  Falls back to ``torch.arange``
+        only when ``t_len > capacity`` (should not happen in practice since
+        ``T <= capacity`` by construction, but guards against misuse).
+        """
+        if t_len <= self.capacity and dtype == torch.long:
+            return self._arange_capacity[:t_len]
+        return torch.arange(t_len, device=device, dtype=dtype)
 
     def reset(self, reset_mask: torch.Tensor) -> None:
         self.end_offset[:] = torch.where(reset_mask, torch.zeros_like(self.end_offset), self.end_offset)
@@ -566,7 +578,7 @@ class RingKVCache:
             end_offset = self.end_offset.index_select(0, slots)
             row_cache = self.cache.index_select(1, slots)
 
-            indexes = self._get_arange_t(T, end_offset.device, end_offset.dtype)  # noqa: N806
+            indexes = self._get_arange_t(T, end_offset.device, end_offset.dtype)
             indexes = (indexes + end_offset.view(-1, 1)) % self.capacity
             scatter_indexes = indexes.view(B, 1, T, 1).expand(-1, H, T, D)
             row_cache[0].scatter_(2, scatter_indexes, k)
@@ -588,10 +600,10 @@ class RingKVCache:
             next_offset = torch.where(valid_rows, end_offset + T, end_offset)
             self.end_offset.index_copy_(0, slots, next_offset)
             invalid = cache_indexes >= next_offset.view(-1, 1)
-            positions = positions.masked_fill_(invalid, -1)
+            positions.masked_fill_(invalid, -1)
             return KVCacheResult(row_cache[0], row_cache[1], positions)
 
-        indexes = self._get_arange_t(T, self.end_offset.device, self.end_offset.dtype)  # noqa: N806
+        indexes = self._get_arange_t(T, self.end_offset.device, self.end_offset.dtype)
         indexes = indexes + self.end_offset.view(-1, 1)
         indexes = indexes % self.capacity
 
@@ -625,7 +637,7 @@ class RingKVCache:
             self.end_offset.add_(T)
 
         invalid = indexes >= self.end_offset.view(-1, 1)
-        positions = positions.masked_fill_(invalid, -1)
+        positions.masked_fill_(invalid, -1)
 
         return KVCacheResult(keys, values, positions)
 
@@ -839,18 +851,22 @@ class MossAudioTokenizerMultiheadAttention(StreamingModule):
             and q.shape[-1] == 64
         ):
             x = streaming_attention(q, k, v, attn_bias)
-        elif q.device.type == "npu":
+        elif q.device.type == "npu" and q.dtype in (torch.float16, torch.bfloat16):
             import torch_npu
 
             if attn_bias is not None:
+                # NPU fusion attention uses True=masked (inverted from SDPA's
+                # True=attend).  The mask is the sole source of visibility:
+                # pre_tockens=capacity and next_tockens=k.shape[-2] are set
+                # wide enough that they cannot tighten the mask result.
                 atten_mask = ~attn_bias
                 pre_tockens = attn_bias.shape[-1]
-                next_tockens = 0
+                next_tockens = k.shape[-2]
             else:
                 atten_mask = None
                 pre_tockens = T
                 next_tockens = T
-            x, _, _, _, _, _, _ = torch_npu.npu_fusion_attention(
+            x = torch_npu.npu_fusion_attention(
                 q,
                 k,
                 v,
@@ -862,7 +878,7 @@ class MossAudioTokenizerMultiheadAttention(StreamingModule):
                 pre_tockens=pre_tockens,
                 next_tockens=next_tockens,
                 sparse_mode=0,
-            )
+            )[0]
         else:
             x = F.scaled_dot_product_attention(q, k, v, attn_bias, dropout_p=0.0)
         x = x.transpose(1, 2).reshape(B, T, self.embed_dim)
@@ -994,7 +1010,7 @@ class MossAudioTokenizerTransformerLayer(StreamingModule):
                 update = apply_weights_per_step(self.gating, self.weights_per_step_schedule, x, offset)
             else:
                 update = self.gating(x)
-        return x_orig + self.layer_scale_2(update)
+        return x_orig.to(update.dtype) + self.layer_scale_2(update)
 
     def _sa_block(
         self,
@@ -1004,7 +1020,7 @@ class MossAudioTokenizerTransformerLayer(StreamingModule):
         x_orig = x
         x = self.norm1(x)
         update = self.self_attn(x, x, x, execution_context=execution_context)
-        return x_orig + self.layer_scale_1(update)
+        return x_orig.to(update.dtype) + self.layer_scale_1(update)
 
     def forward(
         self,
@@ -2095,24 +2111,30 @@ class MossAudioTokenizerModel(MossAudioTokenizerPreTrainedModel):
         if codes_lengths is None:
             codes_lengths = torch.full((B,), T, device=device, dtype=torch.long)
 
-        # With bf16 LUT (lut_dtype=bfloat16 on NPU), the LUT output is already bf16,
-        # matching the bf16 decoder weights. Autocast is no longer needed on NPU
-        # (it was only required because NPU's float32 LUT mismatched bf16 weights).
-        # CUDA keeps its original autocast behavior; CPU keeps autocast disabled.
-        with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"):
-            quantizer = cast(MossAudioTokenizerResidualVQ | MossAudioTokenizerResidualLFQ, self.quantizer)
-            zq = quantizer.decode_codes(codes)
+        # Cast quantizer output to the decoder's weight dtype explicitly.
+        # The decoder weights are bf16 (cast in modeling_moss_tts_codec.py), but
+        # the quantizer's decode_codes may return fp32 (e.g. RVQ without a LUT).
+        # Without autocast, NPU's aclnnLayerNorm rejects mixed dtypes; on CUDA,
+        # mixed dtypes cause silent type promotion (fp32 + bf16 -> fp32) through
+        # all ~92 layers, wasting memory and changing numerics.  Explicitly
+        # casting zq once is cheaper than wrapping the entire decoder in autocast
+        # (one cast vs ~92 layers of per-op dispatch overhead) and works for all
+        # quantizer types (RVQ, LFQ+LUT, etc.).
+        quantizer = cast(MossAudioTokenizerResidualVQ | MossAudioTokenizerResidualLFQ, self.quantizer)
+        zq = quantizer.decode_codes(codes)
+        decoder_weight = next(self.decoder.parameters())
+        zq = zq.to(dtype=decoder_weight.dtype)
 
-            d, d_lengths = zq, codes_lengths
-            for decoder_module in self.decoder:
-                if isinstance(decoder_module, StreamingModule):
-                    d, d_lengths = decoder_module(
-                        d,
-                        d_lengths,
-                        execution_context=execution_context,
-                    )
-                else:
-                    d, d_lengths = decoder_module(d, d_lengths)
+        d, d_lengths = zq, codes_lengths
+        for decoder_module in self.decoder:
+            if isinstance(decoder_module, StreamingModule):
+                d, d_lengths = decoder_module(
+                    d,
+                    d_lengths,
+                    execution_context=execution_context,
+                )
+            else:
+                d, d_lengths = decoder_module(d, d_lengths)
 
         d, d_lengths = self._restore_channels_from_codec(d, d_lengths)
         return d, d_lengths
