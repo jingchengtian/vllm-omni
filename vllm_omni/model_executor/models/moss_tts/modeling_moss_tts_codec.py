@@ -8,7 +8,6 @@
 
 from __future__ import annotations
 
-import os
 from collections.abc import Iterable
 from typing import Any
 
@@ -58,6 +57,10 @@ class _MossCodecStreamSession:
         self._state_capacity = int(state_capacity)
         self._n_vq = int(n_vq)
         self._device = next(codec.parameters()).device
+        # B==1 slice fast path: on NPU, pass the single active slot as a python
+        # int so RingKVCache.complete takes a contiguous *view* of the cache
+        # instead of a gather+writeback. Resolved once here, not per-step.
+        self._slice_fast_path: bool = self._device.type == "npu"
         self._free_stream_slots = list(reversed(range(self._state_capacity)))
         self._leased_slots: set[int] = set()
         self._closed = False
@@ -196,10 +199,9 @@ class _MossCodecStreamSession:
             # B==1 slice fast path: pass the single active slot as a python int
             # (slots[0], NO .item() -> no host sync, async-safe at concurrency).
             # RingKVCache.complete takes a contiguous *view* of the cache instead
-            # of a gather+writeback. None for B>1 (general gather path). Opt out
-            # via MOSS_CODEC_SLICE=0.
+            # of a gather+writeback. None for B>1 (general gather path).
             slot0: int | None = None
-            if self._device.type == "npu" and len(slots) == 1 and os.environ.get("MOSS_CODEC_SLICE", "1") != "0":
+            if self._slice_fast_path and len(slots) == 1:
                 slot0 = int(slots[0])
             result = self._codec.decode_streaming_batch(
                 codes_step,

@@ -158,6 +158,11 @@ class StreamingExecutionContext:
             raise ValueError("Streaming execution metadata must be on the same device as decoder inputs.")
         if self.state_slot_ids.dtype != torch.long or self.valid_rows.dtype != torch.bool:
             raise TypeError("state_slot_ids must be int64 and valid_rows must be bool.")
+        if self.slot0 is not None:
+            if batch_size != 1:
+                raise ValueError(f"slot0 requires batch_size == 1, got {batch_size}")
+            if not 0 <= self.slot0 < state_capacity:
+                raise ValueError(f"slot0 must be in [0, {state_capacity}), got {self.slot0}")
 
 
 class StreamingModule(nn.Module):
@@ -474,7 +479,17 @@ def create_sin_embedding(
 
 
 class KVCacheResult:
-    """Container for KV cache results that supports tuple unpacking."""
+    """Container for KV cache results that supports tuple unpacking.
+
+    .. note::
+        When produced by the B==1 slice fast path in ``RingKVCache.complete``,
+        ``keys`` and ``values`` are *views* that alias persistent cache
+        storage (``cache[0, slot0:slot0+1]``), not copies.  Consumers must
+        treat them as read-only.  An in-place write or an attention kernel
+        that writes into its k/v inputs would silently corrupt the cache.
+        The general gather path returns copies (via ``index_select``) and
+        is not affected.
+    """
 
     __slots__ = ("keys", "values", "positions")
 
@@ -531,7 +546,7 @@ class RingKVCache:
     @staticmethod
     def _compute_positions(
         end_offset: torch.Tensor,
-        step: int,
+        num_frames: int,
         capacity: int,
         valid_rows: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -543,7 +558,7 @@ class RingKVCache:
         Invalid slots (cache index >= next_offset) get position ``-1``.
         """
         cache_indexes = torch.arange(capacity, device=end_offset.device, dtype=torch.long)
-        last_offset = end_offset.view(-1, 1) + step - 1
+        last_offset = end_offset.view(-1, 1) + num_frames - 1
         end_index = last_offset % capacity
         delta = cache_indexes - end_index
         positions = torch.where(
@@ -551,7 +566,7 @@ class RingKVCache:
             last_offset + delta,
             last_offset + delta - capacity,
         )
-        next_offset = torch.where(valid_rows, end_offset + step, end_offset)
+        next_offset = torch.where(valid_rows, end_offset + num_frames, end_offset)
         invalid = cache_indexes >= next_offset.view(-1, 1)
         positions = torch.where(invalid, torch.full_like(positions, -1), positions)
         return positions, next_offset
@@ -1842,7 +1857,7 @@ class MossAudioTokenizerModel(MossAudioTokenizerPreTrainedModel):
         # int (the session passes slots[0] directly -- NO .item(), so no host
         # sync, async-safe at concurrency too). RingKVCache.complete takes a
         # contiguous *view* of the cache instead of a gather+writeback. None for
-        # B>1. Opt out via MOSS_CODEC_SLICE=0 (session sets slot0=None).
+        # B>1.
         execution_context = StreamingExecutionContext(
             state_slot_ids=state_slot_ids,
             valid_rows=valid_rows,
