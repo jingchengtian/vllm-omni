@@ -861,14 +861,30 @@ class MossAudioTokenizerMultiheadAttention(StreamingModule):
                 self._arange_t_cached_len = T
             pos_q = offset.view(-1, 1, 1) + self._arange_t_cache.view(-1, 1)
             delta = pos_q - pos_k
-            attn_bias = (pos_k >= 0) & (delta >= 0)
-            if self.context is not None:
-                attn_bias = attn_bias & (delta < self.context)
-            attn_bias = attn_bias[:, None]
+            # Build mask directly in the convention needed by the active path.
+            # SDPA / streaming_attention use True=attend; npu_fusion_attention
+            # uses True=masked.  On NPU we construct the inverted mask directly
+            # (avoids a ~attn_bias allocation + kernel per layer per step).
+            is_npu = q.device.type == "npu" and q.dtype in (torch.float16, torch.bfloat16)
+            streaming_attention = getattr(self, "_streaming_attention", None)
+            use_npu_path = is_npu and streaming_attention is None
+            if use_npu_path:
+                # NPU convention: True = masked (inverted)
+                attn_bias = (pos_k < 0) | (delta < 0)
+                if self.context is not None:
+                    attn_bias = attn_bias | (delta >= self.context)
+                attn_bias = attn_bias[:, None]
+            else:
+                # SDPA / streaming_attention convention: True = attend
+                attn_bias = (pos_k >= 0) & (delta >= 0)
+                if self.context is not None:
+                    attn_bias = attn_bias & (delta < self.context)
+                attn_bias = attn_bias[:, None]
         else:
             attn_bias = None
+            streaming_attention = getattr(self, "_streaming_attention", None)
+            use_npu_path = False
 
-        streaming_attention = getattr(self, "_streaming_attention", None)
         if (
             streaming_attention is not None
             and attn_bias is not None
@@ -880,17 +896,12 @@ class MossAudioTokenizerMultiheadAttention(StreamingModule):
             torch_npu = _get_torch_npu()
 
             if attn_bias is not None:
-                # NPU fusion attention uses True=masked (inverted from SDPA's
-                # True=attend).  The mask is the sole source of visibility:
+                # attn_bias was already constructed in NPU convention
+                # (True=masked) above, so no ~inversion needed here.
+                # The mask is the sole source of visibility:
                 # pre_tockens=capacity and next_tockens=k.shape[-2] are set
                 # wide enough that they cannot tighten the mask result.
-                # The ~inversion allocates one bool tensor per layer per step;
-                # constructing directly in NPU convention would save this,
-                # but attn_bias is also needed by the streaming_attention path
-                # above (which uses True=attend), so both conventions are
-                # required.  The allocation (~240 KB at B=64/T=15/cap=250) is
-                # negligible vs the ~92-layer attention compute.
-                atten_mask = ~attn_bias
+                atten_mask = attn_bias
                 pre_tockens = attn_bias.shape[-1]
                 next_tockens = k.shape[-2]
             else:
