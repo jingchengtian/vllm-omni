@@ -22,6 +22,7 @@ import copy
 import math
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import cast
 
 import torch
@@ -33,6 +34,17 @@ from transformers.utils import ModelOutput, auto_docstring, logging
 from .configuration_moss_audio_tokenizer_v2 import MossAudioTokenizerConfig
 
 logger = logging.get_logger(__name__)
+
+
+@lru_cache(maxsize=1)
+def _get_torch_npu():
+    """Lazily import torch_npu once at module level (cached)."""
+    try:
+        import torch_npu
+
+        return torch_npu
+    except ImportError:
+        return None
 
 
 # =============================================================================
@@ -344,7 +356,7 @@ def apply_rope(
 
     # Fast path: npu_rotary_mul (fused rotation kernel) on NPU.
     if q.device.type == "npu":
-        import torch_npu
+        torch_npu = _get_torch_npu()
 
         cos_d2 = torch.cos(freqs * ts)  # (..., 1, T, D//2)
         sin_d2 = torch.sin(freqs * ts)
@@ -723,6 +735,10 @@ class MossAudioTokenizerMultiheadAttention(StreamingModule):
         self.num_heads = num_heads
         self.weights_per_step = weights_per_step
         self.weights_per_step_schedule = weights_per_step_schedule
+        # Cache arange(T) for causal mask construction — avoids ~92 redundant
+        # kernel launches per decode step (one per attention layer).
+        self._arange_t_cache: torch.Tensor | None = None
+        self._arange_t_cached_len: int = -1
 
         out_dim = 3 * embed_dim
         mult = 1
@@ -834,7 +850,16 @@ class MossAudioTokenizerMultiheadAttention(StreamingModule):
         pos_k = pos_k[:, None]
 
         if self.causal:
-            pos_q = offset.view(-1, 1, 1) + torch.arange(T, device=q.device, dtype=torch.long).view(-1, 1)
+            # Reuse cached arange(T) — allocated once per attention layer,
+            # lives for the module's lifetime (safe for CUDA graph capture).
+            if (
+                self._arange_t_cache is None
+                or self._arange_t_cached_len != T
+                or self._arange_t_cache.device != q.device
+            ):
+                self._arange_t_cache = torch.arange(T, device=q.device, dtype=torch.long)
+                self._arange_t_cached_len = T
+            pos_q = offset.view(-1, 1, 1) + self._arange_t_cache.view(-1, 1)
             delta = pos_q - pos_k
             attn_bias = (pos_k >= 0) & (delta >= 0)
             if self.context is not None:
@@ -852,13 +877,19 @@ class MossAudioTokenizerMultiheadAttention(StreamingModule):
         ):
             x = streaming_attention(q, k, v, attn_bias)
         elif q.device.type == "npu" and q.dtype in (torch.float16, torch.bfloat16):
-            import torch_npu
+            torch_npu = _get_torch_npu()
 
             if attn_bias is not None:
                 # NPU fusion attention uses True=masked (inverted from SDPA's
                 # True=attend).  The mask is the sole source of visibility:
                 # pre_tockens=capacity and next_tockens=k.shape[-2] are set
                 # wide enough that they cannot tighten the mask result.
+                # The ~inversion allocates one bool tensor per layer per step;
+                # constructing directly in NPU convention would save this,
+                # but attn_bias is also needed by the streaming_attention path
+                # above (which uses True=attend), so both conventions are
+                # required.  The allocation (~240 KB at B=64/T=15/cap=250) is
+                # negligible vs the ~92-layer attention compute.
                 atten_mask = ~attn_bias
                 pre_tockens = attn_bias.shape[-1]
                 next_tockens = k.shape[-2]
