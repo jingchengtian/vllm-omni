@@ -35,6 +35,7 @@ from vllm_omni.model_executor.models.moss_tts.modeling_moss_tts_local_depth impo
     MossTTSLocalDepthTransformer,
 )
 from vllm_omni.model_executor.models.output_templates import OmniOutput
+from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
 
@@ -1353,7 +1354,7 @@ class MossTTSLocalTalkerForGeneration(nn.Module):
         # additive-fusion gathers (avoids an n_vq-iteration Python loop).
         self._stacked_audio_emb_w: torch.Tensor | None = None
         self.mtp_hidden_size = hidden_size
-        self.talker_mtp_graph_safe = False
+        self.talker_mtp_graph_safe = not current_omni_platform.is_npu()
         self.talker_mtp_output_key = ("audio_codes", "current")
         # ``make_omni_output`` keeps code rows fixed-shape and performs all
         # state updates eagerly, so the runner can safely pack/snapshot them
@@ -1786,10 +1787,7 @@ class MossTTSLocalTalkerForGeneration(nn.Module):
         )  # (n_vq, audio_vocab_size, hidden_size)
 
         if not self.vllm_config.model_config.enforce_eager:
-            self.local_transformer.setup_compile(
-                self.n_vq,
-                self.vllm_config.scheduler_config.max_num_seqs,
-            )
+            self.local_transformer.setup_compile()
 
         logger.info(
             "[MossTTSLocal] loaded %d/%d params; skipped=%d (first 5: %s)",
