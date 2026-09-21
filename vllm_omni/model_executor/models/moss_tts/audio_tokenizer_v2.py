@@ -163,6 +163,18 @@ class StreamingExecutionContext:
                 raise ValueError(f"slot0 requires batch_size == 1, got {batch_size}")
             if not 0 <= self.slot0 < state_capacity:
                 raise ValueError(f"slot0 must be in [0, {state_capacity}), got {self.slot0}")
+            # Reject mismatched slot identities: slot0 must equal
+            # state_slot_ids[0] when both are present.  At B==1 the tensor
+            # has exactly one element, so .tolist() is a single-element host
+            # transfer — not a per-step device sync in the hot loop (this
+            # check runs once per decode in validate(), not per layer).
+            expected_slot = self.state_slot_ids.tolist()[0]
+            if self.slot0 != expected_slot:
+                raise ValueError(
+                    f"slot0 ({self.slot0}) must match state_slot_ids[0] "
+                    f"({expected_slot}); mismatched slots silently split a "
+                    f"request's state across two sessions."
+                )
 
 
 class StreamingModule(nn.Module):
