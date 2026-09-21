@@ -217,14 +217,6 @@ class MossTTSLocalDepthTransformer(nn.Module):
         return self.ln_f(self.h[0](seq_embeds, kv_cache, position, attn_mask))
 
     def setup_compile(self) -> None:
-        """Compile the prefix forward for fast per-frame decoding.
-
-        On inductor-capable platforms (GPU) this applies ``torch.compile``.
-        On NPU, ``torch.compile`` is unavailable
-        (``supports_torch_inductor() is False``) and the eager path is used;
-        the NPU whole-loop NPUGraph acceleration is installed separately by
-        the platform adapter under ``platforms/npu/models/``.
-        """
         if self._compiled_forward_prefix is not None:
             return
 
@@ -251,24 +243,6 @@ class MossTTSLocalDepthTransformer(nn.Module):
     ) -> torch.Tensor:
         forward_prefix = self._compiled_forward_prefix or self._forward_prefix
         return forward_prefix(seq_embeds, kv_cache, position, attn_mask)
-
-    def _fwd_incremental_graph(
-        self,
-        x_c: torch.Tensor,
-        cache_k: torch.Tensor,
-        cache_v: torch.Tensor,
-        c: int,
-    ) -> torch.Tensor:
-        """One-position KV-cache forward for position ``c`` (graph-captured).
-
-        Reuses the existing ``forward(kv_cache=...)`` path but passes an
-        ``attn_mask`` so the full ``cache_k`` (fixed shape) is used instead
-        of a dynamic ``[:c+1]`` slice -- required for NPUGraph capture.
-        """
-        n_vq = cache_k.shape[2]
-        mask = torch.ones(1, n_vq, dtype=torch.bool, device=x_c.device)
-        mask[:, c + 1 :] = False
-        return self.ln_f(self.h[0](x_c, (cache_k, cache_v), c, mask))
 
     @torch.no_grad()
     def generate_frame(

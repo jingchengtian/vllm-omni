@@ -68,11 +68,6 @@ class OmniNPUModelRunner(OmniGPUModelRunner, NPUModelRunner):
             from vllm_omni.platforms.npu._310p.patch import apply_model_patches
 
             apply_model_patches(self.model_config)
-        from vllm_omni.platforms.npu.models.moss_tts_local_depth import (
-            apply_moss_tts_local_depth_patch,
-        )
-
-        apply_moss_tts_local_depth_patch()
         NPUModelRunner.load_model(self, *args, **kwargs)
         # Initialize enable_sp cache to avoid get_current_vllm_config() error
         # in _pad_for_sequence_parallelism during execute_model.
