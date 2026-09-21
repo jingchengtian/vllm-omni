@@ -203,6 +203,57 @@ def test_ring_kv_cache_mask_convention_sdpa():
 
 
 # =============================================================================
+# 1c. Platform-independent: attention arange cache retains all sizes (P1)
+# =============================================================================
+
+
+@pytest.mark.cpu
+def test_attention_arange_cache_retains_all_sizes():
+    """_arange_t_cache must retain tensors for all (device, T) pairs, not just
+    the most recent one.
+
+    This is the P1 regression test from amy-why-3459: if changing T replaces
+    the cached tensor, a previously captured CUDA graph that baked in the old
+    pointer would read freed memory.  The fix uses a dict keyed by
+    (device, T) so no allocation is ever released.
+
+    On CPU we verify that both tensors survive in the cache after both sizes
+    are requested.
+    """
+    dev = torch.device("cpu")
+    dtype = torch.bfloat16
+    embed_dim, num_heads = 128, 2
+
+    attn = MossAudioTokenizerMultiheadAttention(
+        embed_dim, num_heads, causal=True, context=30, device=dev, dtype=dtype
+    ).eval()
+
+    # Run with T=5 (populates cache for (cpu, 5))
+    x5 = torch.randn(1, 5, embed_dim, device=dev, dtype=dtype)
+    with torch.inference_mode():
+        attn(x5, x5, x5)
+    assert (dev, 5) in attn._arange_t_cache
+    t5_first = attn._arange_t_cache[(dev, 5)]
+
+    # Run with T=3 (populates cache for (cpu, 3) — must NOT free (cpu, 5))
+    x3 = torch.randn(1, 3, embed_dim, device=dev, dtype=dtype)
+    with torch.inference_mode():
+        attn(x3, x3, x3)
+    assert (dev, 3) in attn._arange_t_cache
+
+    # The T=5 tensor must still be the same object (not freed and reallocated)
+    assert (dev, 5) in attn._arange_t_cache
+    assert attn._arange_t_cache[(dev, 5)] is t5_first, (
+        "T=5 cache entry was replaced — CUDA graph holding the old pointer would read freed memory after T changed"
+    )
+
+    # Run T=5 again — should reuse the same cached tensor
+    with torch.inference_mode():
+        attn(x5, x5, x5)
+    assert attn._arange_t_cache[(dev, 5)] is t5_first
+
+
+# =============================================================================
 # 1b. Platform-independent: RoPE freqs cache (runs on CPU in CI)
 # =============================================================================
 
@@ -328,9 +379,9 @@ def test_attention_forward_npu_branch_matches_sdpa_fallback():
 def test_attention_streaming_mode_with_rotated_mask():
     """NPU attention with streaming mode (capacity >> T, rotated ring-buffer mask).
 
-    This covers the case amy-why-3459 flagged: a non-square (T, capacity) mask
-    that is not lower-triangular in slot space, exercising the next_tockens
-    value with a real rotated ring-buffer mask.
+    Initializes streaming state so the RingKVCache fills and wraps around.
+    Asserts that offsets advance through wraparound and compares each step
+    against an SDPA reference with equivalent state and weights.
     """
     dev = torch.device("npu")
     dtype = torch.bfloat16
@@ -338,23 +389,51 @@ def test_attention_streaming_mode_with_rotated_mask():
     capacity = 30
     T = 5
 
-    attn = MossAudioTokenizerMultiheadAttention(
+    # NPU attention (uses npu_fusion_attention)
+    attn_npu = MossAudioTokenizerMultiheadAttention(
         embed_dim, num_heads, causal=True, context=capacity, device=dev, dtype=dtype
     ).eval()
 
+    # CPU reference (uses SDPA)
+    attn_cpu = MossAudioTokenizerMultiheadAttention(
+        embed_dim, num_heads, causal=True, context=capacity, device="cpu", dtype=dtype
+    ).eval()
+    attn_cpu.load_state_dict(attn_npu.state_dict())
+
     B = 2
-    x = torch.randn(B, T, embed_dim, device=dev, dtype=dtype)
+    # Initialize streaming state for both
+    attn_npu._streaming_state = attn_npu._init_streaming_state(B)
+    attn_cpu._streaming_state = attn_cpu._init_streaming_state(B)
+
+    x_npu = torch.randn(B, T, embed_dim, device=dev, dtype=dtype)
+    x_cpu = x_npu.cpu()
 
     with torch.inference_mode():
-        # Run 7 steps to fill the ring buffer and cause wraparound
-        for _ in range(7):
-            result = attn(x, x, x)
-            assert result.shape == (B, T, embed_dim)
+        for step in range(8):
+            result_npu = attn_npu(x_npu, x_npu, x_npu)
+            result_cpu = attn_cpu(x_cpu, x_cpu, x_cpu)
 
-        # The 8th step: offset=35 > capacity=30, mask is fully rotated
-        result = attn(x, x, x)
-        assert result.shape == (B, T, embed_dim)
-        assert not torch.any(torch.isnan(result))
+            # Assert offsets advance
+            state_npu = attn_npu._streaming_state
+            state_cpu = attn_cpu._streaming_state
+            expected_offset = (step + 1) * T
+            assert state_npu.offset[0].item() == expected_offset, (
+                f"step {step}: NPU offset={state_npu.offset[0].item()}, expected={expected_offset}"
+            )
+            assert state_cpu.offset[0].item() == expected_offset, (
+                f"step {step}: CPU offset={state_cpu.offset[0].item()}, expected={expected_offset}"
+            )
+
+            # After step 6 (offset=35 > capacity=30): wraparound occurred
+            if step >= 6:
+                assert state_npu.offset[0].item() > capacity, (
+                    f"step {step}: offset should exceed capacity={capacity} for wraparound"
+                )
+
+            # Compare NPU vs CPU (SDPA) outputs
+            torch.testing.assert_close(result_npu.cpu(), result_cpu, atol=1e-2, rtol=1e-2)
+
+    assert not torch.any(torch.isnan(result_npu))
 
 
 # =============================================================================

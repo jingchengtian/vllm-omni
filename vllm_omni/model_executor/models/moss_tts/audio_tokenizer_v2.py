@@ -737,8 +737,11 @@ class MossAudioTokenizerMultiheadAttention(StreamingModule):
         self.weights_per_step_schedule = weights_per_step_schedule
         # Cache arange(T) for causal mask construction — avoids ~92 redundant
         # kernel launches per decode step (one per attention layer).
-        self._arange_t_cache: torch.Tensor | None = None
-        self._arange_t_cached_len: int = -1
+        # Uses a dict keyed by (device, T) so that changing T never releases a
+        # previously allocated tensor — this is critical for CUDA graph safety:
+        # a captured graph bakes in the pointer, so the storage must live as
+        # long as the module (and all captured graphs).
+        self._arange_t_cache: dict[tuple[torch.device, int], torch.Tensor] = {}
 
         out_dim = 3 * embed_dim
         mult = 1
@@ -850,16 +853,14 @@ class MossAudioTokenizerMultiheadAttention(StreamingModule):
         pos_k = pos_k[:, None]
 
         if self.causal:
-            # Reuse cached arange(T) — allocated once per attention layer,
-            # lives for the module's lifetime (safe for CUDA graph capture).
-            if (
-                self._arange_t_cache is None
-                or self._arange_t_cached_len != T
-                or self._arange_t_cache.device != q.device
-            ):
-                self._arange_t_cache = torch.arange(T, device=q.device, dtype=torch.long)
-                self._arange_t_cached_len = T
-            pos_q = offset.view(-1, 1, 1) + self._arange_t_cache.view(-1, 1)
+            # Reuse cached arange(T) — keyed by (device, T) so that changing
+            # T never frees a previous allocation (CUDA graph safety: a
+            # captured graph bakes in the pointer, so storage must live as
+            # long as the module and all captured graphs).
+            cache_key = (q.device, T)
+            if cache_key not in self._arange_t_cache:
+                self._arange_t_cache[cache_key] = torch.arange(T, device=q.device, dtype=torch.long)
+            pos_q = offset.view(-1, 1, 1) + self._arange_t_cache[cache_key].view(-1, 1)
             delta = pos_q - pos_k
             # Build mask directly in the convention needed by the active path.
             # SDPA / streaming_attention use True=attend; npu_fusion_attention
