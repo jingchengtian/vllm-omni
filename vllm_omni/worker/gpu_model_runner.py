@@ -1960,9 +1960,8 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
         # (generators) must also run eagerly: a graph wrapper only replays a
         # previously captured device graph and never re-executes the Python
         # talker_mtp, so the per-row generators would be silently ignored.
-        if (
-            not isinstance(self.talker_mtp, current_omni_platform.get_graph_wrapper_cls())
-            or any(generator is not None for generator in row_generators)
+        if not isinstance(self.talker_mtp, current_omni_platform.get_graph_wrapper_cls()) or any(
+            generator is not None for generator in row_generators
         ):
             _cudagraph_mode = CUDAGraphMode.NONE
             num_tokens_padded = decode_batch_size
