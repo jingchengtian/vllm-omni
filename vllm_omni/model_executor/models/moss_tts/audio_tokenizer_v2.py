@@ -315,8 +315,10 @@ def apply_rope(
     (max_abs_diff = 1 ULP). Falls back to the eager path on non-NPU.
 
     When ``cos_sin`` is provided (precomputed by the parent ``Transformer.forward``
-    and shared across all layers), the per-layer cos/sin computation is skipped
-    entirely -- a ~92x reduction in redundant RoPE trig dispatches per step.
+    and shared across all layers within that block), the per-layer cos/sin
+    computation is skipped -- one computation per transformer block instead of
+    one per layer (~86 redundant dispatches removed for a 92-layer / 6-block
+    decoder, ~15x reduction per block).
     """
     if time_before_heads:
         B, T, H, D = q.shape
