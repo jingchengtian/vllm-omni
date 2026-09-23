@@ -283,8 +283,19 @@ class MossTTSCodecDecoder(nn.Module):
         self._stream_req_slots: dict[str, int] = {}
         self._async_chunk = bool(getattr(self.vllm_config.model_config, "async_chunk", False))
         self._streaming_graph_batch_sizes = self._streaming_graph_batch_sizes_from_compilation_config()
+
+        ramp_raw = self._connector_extra().get("codec_chunk_ramp")
+        ramp_frames: set[int] = set()
+        if isinstance(ramp_raw, (list, tuple)):
+            ramp_frames = {int(x) for x in ramp_raw if int(x) > 0}
+        elif isinstance(ramp_raw, str):
+            import re as _re
+            ramp_frames = {int(x) for x in _re.findall(r"\d+", ramp_raw) if int(x) > 0}
+
+        all_frame_sizes = {self._initial_stream_chunk_frames, self._stream_chunk_frames}
+        all_frame_sizes |= ramp_frames
         self._streaming_graph_frame_sizes = sorted(
-            {frames for frames in (self._initial_stream_chunk_frames, self._stream_chunk_frames) if frames > 0}
+            {frames for frames in all_frame_sizes if frames > 0}
         )
 
     # ------------------------------------------------------------------
@@ -665,6 +676,13 @@ class MossTTSCodecDecoder(nn.Module):
         if isinstance(extra_cfg, dict) and name in extra_cfg:
             return int(extra_cfg[name])
         return default
+
+    def _connector_extra(self) -> dict:
+        model_cfg = getattr(self.vllm_config, "model_config", None)
+        connector_cfg = getattr(model_cfg, "stage_connector_config", None)
+        if isinstance(connector_cfg, dict):
+            return connector_cfg.get("extra", connector_cfg) or {}
+        return getattr(connector_cfg, "extra", None) or {}
 
     def _streaming_graph_batch_sizes_from_compilation_config(self) -> list[int]:
         if getattr(self.vllm_config.model_config, "enforce_eager", True):
