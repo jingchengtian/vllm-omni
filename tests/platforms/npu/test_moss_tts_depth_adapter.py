@@ -94,6 +94,37 @@ class TestApplyTopkToppMask:
         result_at_finite = out[finite_mask]
         torch.testing.assert_close(result_at_finite, original_at_finite)
 
+    def test_topk_keeps_exact_k_candidates_on_ties(self):
+        """top-k must keep exactly ``k`` candidates even when the kth value
+        ties, matching ``_sample_token`` (which operates on the compact top-k
+        indices). Threshold masking would retain every token tied with the
+        kth value -- e.g. ``[3, 2, 2, 2]`` with ``top_k=2`` keeps four, not
+        two."""
+        logits = torch.tensor([[3.0, 2.0, 2.0, 2.0]])
+        out = adapter._apply_topk_topp_mask(logits, top_k=2, top_p=1.0)
+        kept = torch.isfinite(out)
+        assert kept.sum().item() == 2
+        # The strictly-largest value (3.0) is always retained.
+        assert kept[0, 0].item() is True
+        assert out[0, 0].item() == 3.0
+        # Exactly one of the tied 2.0 values is retained (not all three).
+        assert int((out[0, 1:] == 2.0).sum()) == 1
+
+    def test_topk_tie_matches_sample_token_candidate_set(self):
+        """The retained candidate set must equal what ``_sample_token`` keeps
+        via ``torch.topk`` for the same tied logits."""
+        torch.manual_seed(0)
+        logits = torch.tensor([[5.0, 4.0, 4.0, 4.0, 1.0]])
+        masked = adapter._apply_topk_topp_mask(logits.clone(), top_k=2, top_p=1.0)
+        adapter_kept = set(torch.isfinite(masked[0]).nonzero(as_tuple=True)[0].tolist())
+
+        # _sample_token's top-k branch gathers over the topk indices; the set
+        # of reachable tokens is exactly those indices.
+        _, top_indices = torch.topk(logits[0], 2)
+        reference_kept = set(top_indices.tolist())
+
+        assert adapter_kept == reference_kept
+
 
 # ---------------------------------------------------------------------------
 # _make_gumbel_noise
@@ -307,6 +338,254 @@ class TestWholeLoopCompute:
 
 
 # ---------------------------------------------------------------------------
+# Per-head temperature guard (matches _sample_token)
+# ---------------------------------------------------------------------------
+
+
+class TestSamplingTemperatureGuard:
+    """``_sample_token`` treats ``temperature<=0`` as greedy even when
+    ``do_sample=True`` and clamps positive temperatures to ``>= 1e-6``. The
+    adapter must mirror this *independently* for the text and audio heads;
+    otherwise ``temperature=0`` divides by zero (``[1, 2]`` -> ``[inf, inf]``
+    -> picks "continue" instead of the greedy "stop") and negative
+    temperatures reverse the logits."""
+
+    def _setup(self):
+        torch.manual_seed(42)
+        model = _make_depth_model()
+        n_vq, vocab, hidden = 12, 50, model.hidden_size
+        audio_lm_heads, audio_embeddings, local_text_lm_head = _make_heads(n_vq, vocab, hidden)
+        backbone = torch.randn(1, hidden)
+        return model, audio_lm_heads, audio_embeddings, local_text_lm_head, backbone, n_vq, vocab
+
+    def test_temperature_zero_is_greedy_under_do_sample(self):
+        """``do_sample=True`` with ``temperature=0`` must behave greedily
+        (matching ``do_sample=False``), not divide by zero into inf/nan."""
+        model, heads, embs, text_head, backbone, n_vq, vocab = self._setup()
+        g = torch.Generator(device="cpu").manual_seed(42)
+        gc, gb = adapter._make_gumbel_noise(torch.device("cpu"), torch.float32, 1, n_vq, vocab, g)
+
+        with torch.inference_mode():
+            greedy_cont, greedy_codes = adapter._whole_loop_compute(
+                model,
+                heads,
+                embs,
+                text_head,
+                do_sample=False,
+                temperature=1.0,
+                top_k=0,
+                top_p=1.0,
+                text_temperature=1.0,
+                text_top_k=0,
+                text_top_p=1.0,
+                n_vq=n_vq,
+                backbone_last_hidden=backbone,
+            )
+            zero_cont, zero_codes = adapter._whole_loop_compute(
+                model,
+                heads,
+                embs,
+                text_head,
+                do_sample=True,
+                temperature=0.0,
+                top_k=50,
+                top_p=1.0,
+                text_temperature=0.0,
+                text_top_k=50,
+                text_top_p=1.0,
+                n_vq=n_vq,
+                backbone_last_hidden=backbone,
+                gumb_codes=gc,
+                gumb_bin=gb,
+            )
+
+        # No inf/nan leaked through a division by zero.
+        assert torch.isfinite(zero_codes.float()).all()
+        assert torch.isfinite(zero_cont.float()).all()
+        # temperature<=0 -> greedy, identical to do_sample=False.
+        torch.testing.assert_close(zero_codes, greedy_codes)
+        torch.testing.assert_close(zero_cont.eq(0), greedy_cont.eq(0))
+
+    def test_negative_temperature_is_greedy_not_reversed(self):
+        """A negative temperature must be greedy (not reverse the logits)."""
+        model, heads, embs, text_head, backbone, n_vq, vocab = self._setup()
+        g = torch.Generator(device="cpu").manual_seed(7)
+        gc, gb = adapter._make_gumbel_noise(torch.device("cpu"), torch.float32, 1, n_vq, vocab, g)
+
+        with torch.inference_mode():
+            greedy_cont, greedy_codes = adapter._whole_loop_compute(
+                model,
+                heads,
+                embs,
+                text_head,
+                do_sample=False,
+                temperature=1.0,
+                top_k=0,
+                top_p=1.0,
+                text_temperature=1.0,
+                text_top_k=0,
+                text_top_p=1.0,
+                n_vq=n_vq,
+                backbone_last_hidden=backbone,
+            )
+            neg_cont, neg_codes = adapter._whole_loop_compute(
+                model,
+                heads,
+                embs,
+                text_head,
+                do_sample=True,
+                temperature=-2.0,
+                top_k=50,
+                top_p=1.0,
+                text_temperature=-2.0,
+                text_top_k=50,
+                text_top_p=1.0,
+                n_vq=n_vq,
+                backbone_last_hidden=backbone,
+                gumb_codes=gc,
+                gumb_bin=gb,
+            )
+
+        torch.testing.assert_close(neg_codes, greedy_codes)
+        torch.testing.assert_close(neg_cont.eq(0), greedy_cont.eq(0))
+
+    def test_mixed_text_greedy_audio_sampled(self):
+        """``do_sample=True`` with ``text_temperature<=0`` (text greedy) and
+        ``temperature>0`` (audio sampled): the continue/stop output must match
+        the all-greedy reference (text greedy in both) and be invariant to the
+        audio Gumbel noise, while the audio codes change with the noise
+        (proving audio is actually sampled, not greedy)."""
+        model, heads, embs, text_head, backbone, n_vq, vocab = self._setup()
+
+        g1 = torch.Generator(device="cpu").manual_seed(1)
+        g2 = torch.Generator(device="cpu").manual_seed(2)
+        gc1, gb1 = adapter._make_gumbel_noise(torch.device("cpu"), torch.float32, 1, n_vq, vocab, g1)
+        gc2, gb2 = adapter._make_gumbel_noise(torch.device("cpu"), torch.float32, 1, n_vq, vocab, g2)
+
+        common = dict(
+            do_sample=True,
+            temperature=1.0,
+            top_k=0,
+            top_p=1.0,
+            text_temperature=0.0,
+            text_top_k=0,
+            text_top_p=1.0,
+            n_vq=n_vq,
+            backbone_last_hidden=backbone,
+        )
+        with torch.inference_mode():
+            cont1, codes1 = adapter._whole_loop_compute(
+                model,
+                heads,
+                embs,
+                text_head,
+                gumb_codes=gc1,
+                gumb_bin=gb1,
+                **common,
+            )
+            cont2, codes2 = adapter._whole_loop_compute(
+                model,
+                heads,
+                embs,
+                text_head,
+                gumb_codes=gc2,
+                gumb_bin=gb2,
+                **common,
+            )
+            greedy_cont, _ = adapter._whole_loop_compute(
+                model,
+                heads,
+                embs,
+                text_head,
+                do_sample=False,
+                temperature=1.0,
+                top_k=0,
+                top_p=1.0,
+                text_temperature=1.0,
+                text_top_k=0,
+                text_top_p=1.0,
+                n_vq=n_vq,
+                backbone_last_hidden=backbone,
+            )
+
+        # Text head is greedy (text_temperature=0) -> continue is independent
+        # of the audio Gumbel noise and matches the all-greedy reference.
+        torch.testing.assert_close(cont1.eq(0), cont2.eq(0))
+        torch.testing.assert_close(cont1.eq(0), greedy_cont.eq(0))
+        # Audio head is sampled (temperature>0) -> codes differ with noise.
+        assert not torch.equal(codes1, codes2)
+
+    def test_mixed_text_sampled_audio_greedy(self):
+        """The symmetric mixed mode: text sampled + audio greedy. Audio codes
+        must match the all-greedy reference and be invariant to the text
+        Gumbel noise, proving the audio greedy guard holds regardless of the
+        text head's sampling state. (The binary text head has only two
+        tokens, so its per-seed choice is not asserted against the greedy
+        reference here; ``test_mixed_text_greedy_audio_sampled`` proves the
+        audio-sampled direction, and this proves the mirrored independence.)"""
+        model, heads, embs, text_head, backbone, n_vq, vocab = self._setup()
+
+        g1 = torch.Generator(device="cpu").manual_seed(3)
+        g2 = torch.Generator(device="cpu").manual_seed(4)
+        gc1, gb1 = adapter._make_gumbel_noise(torch.device("cpu"), torch.float32, 1, n_vq, vocab, g1)
+        gc2, gb2 = adapter._make_gumbel_noise(torch.device("cpu"), torch.float32, 1, n_vq, vocab, g2)
+
+        common = dict(
+            do_sample=True,
+            temperature=0.0,
+            top_k=50,
+            top_p=1.0,
+            text_temperature=1.0,
+            text_top_k=0,
+            text_top_p=1.0,
+            n_vq=n_vq,
+            backbone_last_hidden=backbone,
+        )
+        with torch.inference_mode():
+            cont1, codes1 = adapter._whole_loop_compute(
+                model,
+                heads,
+                embs,
+                text_head,
+                gumb_codes=gc1,
+                gumb_bin=gb1,
+                **common,
+            )
+            cont2, codes2 = adapter._whole_loop_compute(
+                model,
+                heads,
+                embs,
+                text_head,
+                gumb_codes=gc2,
+                gumb_bin=gb2,
+                **common,
+            )
+            _, greedy_codes = adapter._whole_loop_compute(
+                model,
+                heads,
+                embs,
+                text_head,
+                do_sample=False,
+                temperature=1.0,
+                top_k=0,
+                top_p=1.0,
+                text_temperature=1.0,
+                text_top_k=0,
+                text_top_p=1.0,
+                n_vq=n_vq,
+                backbone_last_hidden=backbone,
+            )
+
+        # No inf/nan leaked through the text head's sampling path.
+        assert torch.isfinite(cont1.float()).all()
+        assert torch.isfinite(cont2.float()).all()
+        # Audio head is greedy (temperature=0) -> codes invariant to text noise
+        # and match the all-greedy reference.
+        torch.testing.assert_close(codes1, codes2)
+        torch.testing.assert_close(codes1, greedy_codes)
+
+
+# ---------------------------------------------------------------------------
 # _patched_generate_frame dispatch gating
 # ---------------------------------------------------------------------------
 
@@ -401,3 +680,137 @@ class TestPatchedGenerateFrameDispatch:
         with torch.inference_mode():
             out = adapter._patched_generate_frame(model, backbone, heads, embs, text_head, n_vq=n_vq, do_sample=False)
         assert out[1].shape == (1, n_vq)
+
+
+# ---------------------------------------------------------------------------
+# AR worker startup registration (Fix A: patch wired into the AR init path)
+# ---------------------------------------------------------------------------
+
+
+class TestArWorkerPatchRegistration:
+    """Verify the depth patch is installed through the AR worker startup path.
+
+    MOSS stage 0 runs on ``NPUARWorker``, whose ``init_device`` inherits
+    vllm-ascend's ``_init_device`` and never reaches ``NPUOmniPlatform.set_device``.
+    Registration therefore hangs off ``init_ar_worker_runtime``, invoked from
+    ``NPUARWorker.init_device`` before model loading.
+    """
+
+    @pytest.fixture
+    def restored_patch(self):
+        """Save/restore the adapter's global patch state around each test."""
+        from vllm_omni.model_executor.models.moss_tts.modeling_moss_tts_local_depth import (
+            MossTTSLocalDepthTransformer,
+        )
+
+        cls = MossTTSLocalDepthTransformer
+        orig_patched = adapter._PATCHED
+        orig_setup = cls.setup_compile
+        orig_gen = cls.generate_frame
+        try:
+            yield cls
+        finally:
+            cls.setup_compile = orig_setup
+            cls.generate_frame = orig_gen
+            adapter._PATCHED = orig_patched
+            adapter._original_setup_compile = None
+            adapter._original_generate_frame = None
+
+    def test_init_ar_worker_runtime_installs_depth_patch(self, restored_patch):
+        """``NPUOmniPlatform.init_ar_worker_runtime`` installs the patched
+        ``setup_compile`` / ``generate_frame`` on the depth transformer class."""
+        pytest.importorskip("vllm_ascend")
+        from vllm_omni.platforms.npu.platform import NPUOmniPlatform
+
+        cls = restored_patch
+        adapter._PATCHED = False
+
+        NPUOmniPlatform.init_ar_worker_runtime(vllm_config=SimpleNamespace(), device=torch.device("cpu"))
+
+        assert adapter._PATCHED is True
+        assert cls.setup_compile is adapter._patched_setup_compile
+        assert cls.generate_frame is adapter._patched_generate_frame
+
+    def test_init_ar_worker_runtime_is_idempotent(self, restored_patch):
+        """A second call must not re-swap (the ``_PATCHED`` guard holds), so
+        the original methods captured on the first call stay consistent."""
+        pytest.importorskip("vllm_ascend")
+        from vllm_omni.platforms.npu.platform import NPUOmniPlatform
+
+        cls = restored_patch
+        adapter._PATCHED = False
+
+        NPUOmniPlatform.init_ar_worker_runtime(vllm_config=SimpleNamespace(), device=torch.device("cpu"))
+        first_setup = cls.setup_compile
+        first_gen = cls.generate_frame
+        assert adapter._original_setup_compile is not None
+
+        NPUOmniPlatform.init_ar_worker_runtime(vllm_config=SimpleNamespace(), device=torch.device("cpu"))
+        assert cls.setup_compile is first_setup
+        assert cls.generate_frame is first_gen
+
+    def test_ar_worker_init_device_invokes_ar_runtime_hook(self, monkeypatch):
+        """``NPUARWorker.init_device`` must call
+        ``current_omni_platform.init_ar_worker_runtime(vllm_config, device)``
+        before constructing the model runner."""
+        pytest.importorskip("vllm_ascend")
+        from vllm_omni.platforms import current_omni_platform
+        from vllm_omni.platforms.npu.worker import npu_ar_worker as mod
+        from vllm_omni.platforms.npu.worker.npu_ar_worker import NPUARWorker
+
+        # Build a worker instance without running the real __init__ (which
+        # needs a fully configured vllm_config + distributed env).
+        worker = NPUARWorker.__new__(NPUARWorker)
+        fake_device = torch.device("cpu")
+        fake_config = SimpleNamespace()
+        worker._init_device = lambda: fake_device  # type: ignore[method-assign]
+        worker.vllm_config = fake_config
+        worker.model_runner_cls = lambda *a, **k: None  # type: ignore[method-assign]
+        monkeypatch.setattr(mod, "init_workspace_manager", lambda *a, **k: None)
+
+        calls: list[tuple] = []
+
+        # An instance attribute shadows the classmethod, so the call resolves
+        # to spy(vllm_config, device) without an implicit cls/self binding.
+        def spy(vllm_config, device):
+            calls.append((vllm_config, device))
+
+        monkeypatch.setattr(current_omni_platform, "init_ar_worker_runtime", spy)
+
+        worker.init_device()
+
+        assert len(calls) == 1
+        assert calls[0][0] is fake_config
+        assert calls[0][1] is fake_device
+
+    def test_ar_worker_init_device_installs_patch_through_hook(self, restored_patch, monkeypatch):
+        """End-to-end-on-CPU: ``NPUARWorker.init_device`` drives the real
+        ``init_ar_worker_runtime`` so the depth methods are patched before the
+        model runner is constructed."""
+        pytest.importorskip("vllm_ascend")
+        from vllm_omni.platforms import current_omni_platform
+        from vllm_omni.platforms.npu.worker import npu_ar_worker as mod
+        from vllm_omni.platforms.npu.worker.npu_ar_worker import NPUARWorker
+
+        # Only run where the active platform is the NPU platform (its
+        # init_ar_worker_runtime actually applies the patch); elsewhere the
+        # default no-op would make this assertion meaningless.
+        if not current_omni_platform.is_npu():
+            pytest.skip("requires NPUOmniPlatform as the active platform")
+
+        cls = restored_patch
+        adapter._PATCHED = False
+
+        worker = NPUARWorker.__new__(NPUARWorker)
+        worker._init_device = lambda: torch.device("cpu")  # type: ignore[method-assign]
+        worker.vllm_config = SimpleNamespace()
+        runner_built = []
+        worker.model_runner_cls = lambda *a, **k: runner_built.append(True)  # type: ignore[method-assign]
+        monkeypatch.setattr(mod, "init_workspace_manager", lambda *a, **k: None)
+
+        worker.init_device()
+
+        # The patch was installed before the model runner was constructed.
+        assert adapter._PATCHED is True
+        assert cls.setup_compile is adapter._patched_setup_compile
+        assert runner_built == [True]

@@ -41,14 +41,18 @@ def _apply_topk_topp_mask(logits: torch.Tensor, top_k: int, top_p: float) -> tor
     the whole-loop graph samples via Gumbel-max instead (a captured
     NPUGraph cannot run ``multinomial`` with a per-request generator on
     NPU).
+
+    The top-k step keeps the *exact* candidate set returned by ``topk``
+    (scattering the selected values back into a -inf-filled tensor), so
+    tied logits do not widen the candidate set beyond ``k`` -- matching
+    ``_sample_token``, which operates on the compact top-k indices.
+    Threshold masking (``logits < kth``) would instead retain every token
+    tied with the kth value (e.g. ``[3, 2, 2, 2]`` with ``top_k=2`` keeps
+    four candidates, not two).
     """
     if top_k and 0 < top_k < logits.shape[-1]:
-        top_vals, _ = torch.topk(logits, top_k, dim=-1)
-        logits = torch.where(
-            logits < top_vals[..., -1:],
-            torch.full_like(logits, float("-inf")),
-            logits,
-        )
+        top_vals, top_indices = torch.topk(logits, top_k, dim=-1)
+        logits = torch.full_like(logits, float("-inf")).scatter_(-1, top_indices, top_vals)
     if 0.0 < top_p < 1.0:
         sorted_logits, sorted_idx = torch.sort(logits, descending=True, dim=-1)
         probs = F.softmax(sorted_logits, dim=-1)
@@ -146,16 +150,20 @@ def _whole_loop_compute(
     h0 = _fwd_incremental_graph(depth_model, embeds_buf[:, 0:1], cache_k, cache_v, 0)
     lh = h0[:, 0]
     bl = local_text_lm_head(lh).float()
-    if do_sample:
-        bl = _apply_topk_topp_mask(bl / text_temperature, text_top_k, text_top_p)
+    # Mirror _sample_token per head: temperature<=0 (even with do_sample=True)
+    # is greedy, and a positive temperature is clamped to >= 1e-6 to avoid
+    # division by zero. The text and audio heads are guarded independently so
+    # a mixed mode (e.g. text_temperature<=0 greedy + audio sampled) is exact.
+    if do_sample and text_temperature > 0:
+        bl = _apply_topk_topp_mask(bl / max(text_temperature, 1e-6), text_top_k, text_top_p)
         bin_tok = (bl + gumb_bin).argmax(-1)
     else:
         bin_tok = bl.argmax(-1)
     cont_buf.copy_(bin_tok)
 
     cl = audio_lm_heads[0](lh).float()
-    if do_sample:
-        cl = _apply_topk_topp_mask(cl / temperature, top_k, top_p)
+    if do_sample and temperature > 0:
+        cl = _apply_topk_topp_mask(cl / max(temperature, 1e-6), top_k, top_p)
         tok = (cl + gumb_codes[:, 0]).argmax(-1)
     else:
         tok = cl.argmax(-1)
@@ -166,8 +174,8 @@ def _whole_loop_compute(
         hc = _fwd_incremental_graph(depth_model, embeds_buf[:, c : c + 1], cache_k, cache_v, c)
         lh = hc[:, 0]
         cl = audio_lm_heads[c](lh).float()
-        if do_sample:
-            cl = _apply_topk_topp_mask(cl / temperature, top_k, top_p)
+        if do_sample and temperature > 0:
+            cl = _apply_topk_topp_mask(cl / max(temperature, 1e-6), top_k, top_p)
             tok = (cl + gumb_codes[:, c]).argmax(-1)
         else:
             tok = cl.argmax(-1)
