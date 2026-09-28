@@ -14,6 +14,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 from typing import cast
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -680,6 +681,79 @@ class TestPatchedGenerateFrameDispatch:
         with torch.inference_mode():
             out = adapter._patched_generate_frame(model, backbone, heads, embs, text_head, n_vq=n_vq, do_sample=False)
         assert out[1].shape == (1, n_vq)
+
+    def test_batch_over_max_falls_back_to_eager(self, monkeypatch):
+        """Batches above _MAX_GRAPH_BATCH must not be captured/replayed.
+
+        The whole-loop graph only wins at small batch, where per-step launch
+        overhead dominates; above the measured crossover replay is slower than
+        eager, so dispatch must defer to the original generate_frame.
+        """
+        model, heads, embs, text_head, backbone, n_vq = self._setup()
+        monkeypatch.setattr(adapter, "_MAX_GRAPH_BATCH", 1)
+        calls: list[tuple[int, ...]] = []
+        monkeypatch.setattr(adapter, "_make_gumbel_noise", lambda *a, **k: calls.append(("noise", a[2])) or None)
+
+        cls = type(model)
+        adapter._original_generate_frame = cls.generate_frame
+        big = torch.randn(2, model.hidden_size)
+        with torch.inference_mode():
+            out = adapter._patched_generate_frame(model, big, heads, embs, text_head, n_vq=n_vq, do_sample=False)
+        assert out[1].shape == (2, n_vq)
+        assert calls == [], "graph path was taken for a batch above _MAX_GRAPH_BATCH"
+
+    def test_batch_at_max_still_uses_graph(self, monkeypatch):
+        """A batch exactly at _MAX_GRAPH_BATCH must still reach the graph path."""
+        model, heads, embs, text_head, backbone, n_vq = self._setup()
+        monkeypatch.setattr(adapter, "_MAX_GRAPH_BATCH", 2)
+
+        seen: list[str] = []
+        dummy = cast(adapter.NPUExactGraphRunner, SimpleNamespace())
+
+        def fake_run(name, inputs, constants, compute):
+            seen.append(name)
+            batch = inputs[0].shape[0]
+            cont = torch.zeros(batch, dtype=torch.long)
+            codes = torch.zeros(batch, constants[0], dtype=torch.long)
+            return cont, codes
+
+        dummy.run = fake_run  # type: ignore[attr-defined]
+        adapter._depth_graph_runners[model] = dummy
+        cls = type(model)
+        adapter._original_generate_frame = cls.generate_frame
+        monkeypatch.setattr(adapter, "_make_gumbel_noise", lambda *a, **k: (None, None))
+        monkeypatch.setattr(adapter, "_whole_loop_compute", lambda *a, **k: None)
+        try:
+            # Stand-in for an NPU-resident hidden state: the graph dispatch gate
+            # only reads .device.type, .shape[0] and calls .to(dtype).
+            class _FakeHidden:
+                device = SimpleNamespace(type="npu")
+                shape = (2, model.hidden_size)
+
+                def to(self, dtype):
+                    return self
+
+            with torch.inference_mode(), patch.object(torch.npu, "is_current_stream_capturing", return_value=False):
+                monkeypatch.setattr(model.h[0].attn, "prepare_rope_cache", lambda *a, **k: None)
+                adapter._patched_generate_frame(model, _FakeHidden(), heads, embs, text_head, n_vq=n_vq, do_sample=True)
+            assert seen == ["depth_whole_loop"]
+        finally:
+            del adapter._depth_graph_runners[model]
+
+    def test_max_graph_batch_default_is_sixteen(self):
+        """The default gate is B<=16: the range where the graph wins in both modes.
+
+        Measured on Ascend 910B2C (this branch, in-process A/B, no RNG, 8 warm
+        groups of median-of-30, seed fixed): greedy 1.42x/1.16x/1.11x at
+        B=1/8/16 then 1.02x/1.01x/1.00x/0.97x/0.98x at B=20/24/32/48/64;
+        sampling 1.65x/1.27x/1.28x at B=1/8/16 then 1.08x/0.99x/0.99x/0.91x/
+        0.92x at B=20/24/32/48/64. The sampling crossover is the earlier of the
+        two and is the path real requests take, so gate at the largest batch
+        that still wins in both; past it the paths are at parity and the graph
+        would only add fixed-shape capture and its extra buffers. Raise it with
+        MOSS_TTS_LOCAL_DEPTH_GRAPH_MAX_BATCH.
+        """
+        assert adapter._MAX_GRAPH_BATCH == 16
 
 
 # ---------------------------------------------------------------------------
