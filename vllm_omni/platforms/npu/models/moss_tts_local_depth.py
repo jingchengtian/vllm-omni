@@ -187,6 +187,11 @@ def _whole_loop_compute(
     used when the call's params match the captured ones -- see dispatch in
     ``_patched_generate_frame``).
     """
+    # `gumb_*` are read only under `do_sample and <head temperature> > 0`,
+    # which is exactly the condition under which the dispatch passes them
+    # (see `_patched_generate_frame`). Each assert documents that invariant and
+    # turns a violated contract into a clear error instead of a `None`
+    # subscript; they cost nothing in the captured path.
     B = backbone_last_hidden.shape[0]
     H = depth_model.hidden_size
     dtype = backbone_last_hidden.dtype
@@ -217,6 +222,7 @@ def _whole_loop_compute(
     # division by zero. The text and audio heads are guarded independently so
     # a mixed mode (e.g. text_temperature<=0 greedy + audio sampled) is exact.
     if do_sample and text_temperature > 0:
+        assert gumb_bin is not None
         bl = _apply_topk_topp_mask(bl / max(text_temperature, 1e-6), text_top_k, text_top_p)
         bin_tok = (bl + gumb_bin).argmax(-1)
     else:
@@ -224,6 +230,7 @@ def _whole_loop_compute(
 
     cl = audio_lm_heads[0](lh).float()
     if do_sample and temperature > 0:
+        assert gumb_codes is not None
         cl = _apply_topk_topp_mask(cl / max(temperature, 1e-6), top_k, top_p)
         tok = (cl + gumb_codes[:, 0]).argmax(-1)
     else:
@@ -240,6 +247,7 @@ def _whole_loop_compute(
         lh = hc[:, 0]
         cl = audio_lm_heads[c](lh).float()
         if do_sample and temperature > 0:
+            assert gumb_codes is not None
             cl = _apply_topk_topp_mask(cl / max(temperature, 1e-6), top_k, top_p)
             tok = (cl + gumb_codes[:, c]).argmax(-1)
         else:
@@ -306,6 +314,7 @@ def _patched_generate_frame(
         and backbone_last_hidden.shape[0] <= _MAX_GRAPH_BATCH
         and not torch.npu.is_current_stream_capturing()
     ):
+        active_runner: NPUExactGraphRunner = runner
         dtype = self.ln_f.weight.dtype
         for block in self.h:
             block.attn.prepare_rope_cache(n_vq, backbone_last_hidden.device, dtype)
@@ -324,6 +333,7 @@ def _patched_generate_frame(
             id(local_text_lm_head),
         )
 
+        inputs: tuple[torch.Tensor, ...]
         if do_sample:
             vocab = audio_lm_heads[0].out_features
             gumb_codes, gumb_bin = _make_gumbel_noise(
@@ -335,50 +345,45 @@ def _patched_generate_frame(
                 generator,
             )
             inputs = (backbone_last_hidden.to(dtype), gumb_codes, gumb_bin)
-
-            def compute(bh: torch.Tensor, gc: torch.Tensor, gb: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-                return _whole_loop_compute(
-                    self,
-                    audio_lm_heads,
-                    audio_embeddings,
-                    local_text_lm_head,
-                    do_sample,
-                    temperature,
-                    top_k,
-                    top_p,
-                    text_temperature,
-                    text_top_k,
-                    text_top_p,
-                    n_vq,
-                    bh,
-                    gc,
-                    gb,
-                )
-
         else:
+            gumb_codes = gumb_bin = None
             inputs = (backbone_last_hidden.to(dtype),)
 
-            def compute(bh: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-                return _whole_loop_compute(
-                    self,
-                    audio_lm_heads,
-                    audio_embeddings,
-                    local_text_lm_head,
-                    do_sample,
-                    temperature,
-                    top_k,
-                    top_p,
-                    text_temperature,
-                    text_top_k,
-                    text_top_p,
-                    n_vq,
-                    bh,
-                )
+        def compute(
+            bh: torch.Tensor,
+            gc: torch.Tensor | None = None,
+            gb: torch.Tensor | None = None,
+            *,
+            _model: nn.Module = self,
+            _heads: nn.ModuleList = audio_lm_heads,
+            _embeds: nn.ModuleList = audio_embeddings,
+            _text_head: nn.Module = local_text_lm_head,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            return _whole_loop_compute(
+                _model,
+                _heads,
+                _embeds,
+                _text_head,
+                do_sample,
+                temperature,
+                top_k,
+                top_p,
+                text_temperature,
+                text_top_k,
+                text_top_p,
+                n_vq,
+                bh,
+                gc,
+                gb,
+            )
 
-        cont_buf, codes_buf = runner.run("depth_whole_loop", inputs, constants, compute)
+        cont_buf, codes_buf = active_runner.run("depth_whole_loop", inputs, constants, compute)
         should_continue = cont_buf.eq(0)
         return should_continue, codes_buf
 
+    # Set in `apply_moss_tts_local_depth_patch`, which installs this function as
+    # the class method, so it is non-None whenever the patch is active.
+    assert _original_generate_frame is not None
     return _original_generate_frame(
         self,
         backbone_last_hidden,

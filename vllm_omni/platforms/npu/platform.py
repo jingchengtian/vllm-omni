@@ -7,6 +7,7 @@ from typing import Any
 
 import torch
 import torch.nn as nn
+from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm_ascend.platform import NPUPlatform
 
@@ -92,7 +93,7 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
     @classmethod
     def init_ar_worker_runtime(
         cls,
-        vllm_config: Any,
+        vllm_config: VllmConfig,
         device: torch.device,
     ) -> None:
         super().init_ar_worker_runtime(vllm_config, device)

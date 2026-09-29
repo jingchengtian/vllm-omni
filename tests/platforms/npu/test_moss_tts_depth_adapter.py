@@ -691,8 +691,12 @@ class TestPatchedGenerateFrameDispatch:
         """
         model, heads, embs, text_head, backbone, n_vq = self._setup()
         monkeypatch.setattr(adapter, "_MAX_GRAPH_BATCH", 1)
-        calls: list[tuple[int, ...]] = []
-        monkeypatch.setattr(adapter, "_make_gumbel_noise", lambda *a, **k: calls.append(("noise", a[2])) or None)
+        calls: list[tuple[object, ...]] = []
+
+        def _record_noise(*args: object, **_: object) -> None:
+            calls.append(("noise", args[2]))
+
+        monkeypatch.setattr(adapter, "_make_gumbel_noise", _record_noise)
 
         cls = type(model)
         adapter._original_generate_frame = cls.generate_frame
@@ -842,7 +846,7 @@ class TestArWorkerPatchRegistration:
         worker.model_runner_cls = lambda *a, **k: None  # type: ignore[method-assign]
         monkeypatch.setattr(mod, "init_workspace_manager", lambda *a, **k: None)
 
-        calls: list[tuple] = []
+        calls: list[tuple[object, object]] = []
 
         # An instance attribute shadows the classmethod, so the call resolves
         # to spy(vllm_config, device) without an implicit cls/self binding.

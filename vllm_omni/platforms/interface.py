@@ -242,7 +242,7 @@ class OmniPlatform(Platform):
     @classmethod
     def init_ar_worker_runtime(
         cls,
-        vllm_config: Any,
+        vllm_config: VllmConfig,
         device: torch.device,
     ) -> None:
         """Initialize platform-specific runtime state for AR workers.
