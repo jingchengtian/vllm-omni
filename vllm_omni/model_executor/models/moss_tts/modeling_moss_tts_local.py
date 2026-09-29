@@ -138,6 +138,24 @@ class MossTTSRealtimeLocalTransformer(nn.Module):
         return codes
 
 
+def _normalize_generators(
+    generators: Sequence[torch.Generator | None] | None,
+    batch_size: int,
+) -> list[torch.Generator | None] | None:
+    """Validate per-row generators against the batch they will sample for.
+
+    Mirrors ``Qwen3CodePredictor._normalize_generators``: a length mismatch is
+    an error instead of a silent per-row fallback to the global RNG, which would
+    quietly break reproducibility of seeded requests.
+    """
+    if generators is None:
+        return None
+    row_generators = list(generators)
+    if len(row_generators) != batch_size:
+        raise ValueError(f"Expected {batch_size} per-row generators, but got {len(row_generators)}.")
+    return row_generators
+
+
 def _sample_token(
     logits: torch.Tensor,
     temperature: float,
@@ -158,6 +176,8 @@ def _sample_token(
     When ``generators`` is provided (per-row), each row is sampled with its
     own generator via separate ``multinomial`` calls. This keeps the rest of
     the forward batched while making seeded requests reproducible per-row.
+    ``generators`` must hold exactly one entry per batch row; a mismatch raises
+    ``ValueError`` rather than silently falling back to the global RNG.
     """
     if not do_sample or temperature <= 0:
         return logits.argmax(dim=-1)
@@ -186,15 +206,14 @@ def _sample_token(
             logits = torch.full_like(logits, float("-inf")).scatter_(-1, sorted_indices, logits)
 
     probs = F.softmax(logits, dim=-1)
-
-    if generators is not None and any(g is not None for g in generators):
-        B = probs.shape[0]
+    B = int(probs.shape[0])
+    row_generators = _normalize_generators(generators, B)
+    if row_generators is not None and any(gen is not None for gen in row_generators):
         rows = []
         for row in range(B):
-            gen = generators[row] if row < len(generators) else None
             row_probs = probs[row : row + 1]
             flat = row_probs.reshape(-1, row_probs.shape[-1])
-            sampled = torch.multinomial(flat, num_samples=1, generator=gen)
+            sampled = torch.multinomial(flat, num_samples=1, generator=row_generators[row])
             rows.append(sampled)
         sampled = torch.cat(rows, dim=0).reshape(probs.shape[:-1])
     else:
