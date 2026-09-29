@@ -1628,8 +1628,8 @@ class MossTTSLocalTalkerForGeneration(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         bsz = int(input_embeds.shape[0])
         # One generator per row, or the extra rows would silently sample from
-        # the global RNG. Validate before the n_vq-step depth loop so a
-        # mis-sized batch fails on entry.
+        # the global RNG. Validate before the n_vq-step depth loop so a wrong
+        # generator count fails on entry.
         generators = _normalize_generators(generators, bsz)
         input_embeds_out = input_embeds.reshape(bsz, -1)
         last_talker_hidden = last_talker_hidden.reshape(bsz, -1).to(
