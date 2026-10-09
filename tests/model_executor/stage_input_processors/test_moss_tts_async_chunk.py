@@ -37,8 +37,10 @@ class _Request:
     external_req_id: str
 
 
-def _manager(ramp: object = None, *, first: int = 1) -> _TransferManager:
-    extra = {"initial_codec_chunk_frames": first, "codec_chunk_frames": 15, "codec_chunk_ramp": ramp}
+def _manager(ramp: object = None, *, first: int = 1, adaptive: bool = False) -> _TransferManager:
+    extra: dict[str, object] = {"initial_codec_chunk_frames": first, "codec_chunk_frames": 15, "codec_chunk_ramp": ramp}
+    if adaptive:
+        extra["codec_chunk_adaptive"] = True
     return _TransferManager(_Connector({"extra": extra}))
 
 
@@ -135,3 +137,91 @@ def test_graph_shapes_and_fast_path_follow_sender(
     assert codec._stream_max_step_frames == max_step
     assert codec._first_chunk_fast
     assert codec._initial_stream_chunk_frames == effective_first
+
+
+# ---------------------------------------------------------------------------
+# Adaptive controller
+# ---------------------------------------------------------------------------
+
+
+def test_adaptive_chunk_0_uses_ic_threshold() -> None:
+    """Chunk 0 under adaptive uses the same IC/steady threshold as default."""
+    manager = _manager(adaptive=True, first=1)
+    packet = _emit(manager, "a", 0)
+    assert packet is not None
+    assert packet.meta.codec_chunk_frames == 1
+    assert not bool(packet.meta.finished)
+
+
+def test_adaptive_finish_flushes_remaining() -> None:
+    """Adaptive flushes all remaining frames on finish."""
+    manager = _manager(adaptive=True, first=1)
+    # Chunk 0: emit 1 frame (IC threshold = 1).
+    first = _emit(manager, "a", 0)
+    assert first is not None
+    assert first.meta.codec_chunk_frames == 1
+    # Feed 1 more frame (pending=1, adaptive target>=2, hold — no emit).
+    held = _emit(manager, "a", 1)
+    assert held is None
+    # Finish with 1 pending → flush.
+    final = _emit(manager, "a", None, finished=True)
+    assert final is not None
+    assert bool(final.meta.finished)
+    assert final.meta.codec_chunk_frames == 1
+    assert "a" not in manager.code_prompt_token_ids
+
+
+def test_adaptive_empty_finish_returns_sentinel() -> None:
+    """Adaptive returns an empty-finished sentinel when no frames remain."""
+    manager = _manager(adaptive=True, first=1)
+    # Emit chunk 0, then finish with no pending frames.
+    first = _emit(manager, "a", 0)
+    assert first is not None
+    # Flush remaining with finish + no new frames.
+    final = _emit(manager, "a", None, finished=True)
+    assert final is not None
+    assert bool(final.meta.finished)
+    assert final.meta.codec_chunk_frames == 0
+    assert final.codes.audio.numel() == 0
+
+
+def test_adaptive_takes_precedence_over_ramp() -> None:
+    """When both codec_chunk_ramp and codec_chunk_adaptive are set, adaptive wins."""
+    manager = _manager(ramp=[4, 8, 15], adaptive=True, first=1)
+    # Chunk 0: adaptive uses IC=1, not ramp's first entry (4).
+    packet = _emit(manager, "a", 0)
+    assert packet is not None
+    assert packet.meta.codec_chunk_frames == 1
+
+
+def test_adaptive_requests_progress_independently() -> None:
+    """Two requests under adaptive do not interfere."""
+    manager = _manager(adaptive=True, first=1)
+    # Start both requests — chunk 0 emits 1 frame each.
+    a0 = _emit(manager, "a", 0)
+    b0 = _emit(manager, "b", 0)
+    assert a0 is not None and b0 is not None
+    assert a0.meta.codec_chunk_frames == 1
+    assert b0.meta.codec_chunk_frames == 1
+    # Feed 1 more frame to 'a' (held by adaptive target >= 2).
+    assert _emit(manager, "a", 1) is None
+    # Finish 'a' with 1 pending → flush 1.
+    final_a = _emit(manager, "a", None, finished=True)
+    assert final_a is not None
+    assert bool(final_a.meta.finished)
+    assert final_a.meta.codec_chunk_frames == 1
+    # 'b' can still be finished independently.
+    final_b = _emit(manager, "b", None, finished=True)
+    assert final_b is not None
+    assert bool(final_b.meta.finished)
+
+
+def test_adaptive_states_present_during_request() -> None:
+    """The adaptive controller is created on chunk 0 and persists until finish."""
+    manager = _manager(adaptive=True, first=1)
+    _emit(manager, "a", 0)
+    assert hasattr(manager, "_adaptive_states")
+    assert "a" in manager._adaptive_states
+    # Finish cleans up processor-side pending frames.
+    _emit(manager, "a", None, finished=True)
+    assert "a" not in manager.code_prompt_token_ids

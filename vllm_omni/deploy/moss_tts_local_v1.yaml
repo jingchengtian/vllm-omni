@@ -26,6 +26,10 @@ connectors:
       # initial_codec_chunk_frames -> codec_chunk_frames cliff. The last
       # entry should equal codec_chunk_frames (steady state).
       # codec_chunk_ramp: [2, 4, 8, 15]
+      # Adaptive chunk ramp (opt-in): buffer-feedback controller that
+      # auto-tunes chunk sizes across hardware. Takes precedence over
+      # codec_chunk_ramp when both are set.
+      # codec_chunk_adaptive: true
 
 stages:
   - stage_id: 0

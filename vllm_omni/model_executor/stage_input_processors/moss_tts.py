@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import time
 from collections import defaultdict
 from collections.abc import Mapping
 from typing import Any
@@ -18,7 +19,13 @@ from vllm.inputs import TokensPrompt as OmniTokensPrompt
 from vllm.logger import init_logger
 
 from vllm_omni.data_entry_keys import CodesStruct, MetaStruct, OmniPayloadStruct
-from vllm_omni.model_executor.stage_input_processors.chunk_size_utils import parse_chunk_ramp, ramp_chunk_size
+from vllm_omni.model_executor.stage_input_processors.chunk_size_utils import (
+    AdaptiveChunkController,
+    compute_adaptive_emit,
+    parse_adaptive_config,
+    parse_chunk_ramp,
+    ramp_chunk_size,
+)
 
 logger = init_logger(__name__)
 
@@ -240,6 +247,9 @@ def talker2codec_raw_async_chunk(
     a codec chunk is ready, then forwards the chunk to Stage 1. No delay-pattern
     de-delay is applied on this path. An optional ``codec_chunk_ramp`` selects
     successive chunk sizes and takes precedence over the initial chunk size.
+    An optional ``codec_chunk_adaptive`` enables a buffer-feedback controller
+    that auto-tunes chunk sizes across hardware; it takes precedence over the
+    static ramp when both are configured.
     """
     external_req_id = getattr(request, "external_req_id", None)
     req_id = str(external_req_id if external_req_id is not None else getattr(request, "request_id", id(request)))
@@ -301,11 +311,131 @@ def talker2codec_raw_async_chunk(
     if not hasattr(transfer_manager, "_moss_chunk_ramp"):
         transfer_manager._moss_chunk_ramp = parse_chunk_ramp(cfg, steady=chunk_frames)
     ramp = transfer_manager._moss_chunk_ramp
+
+    # --- Adaptive controller (takes precedence over static ramp) ---
+    # Parse once per transfer_manager; config is static for its lifetime.
+    if not hasattr(transfer_manager, "_adaptive_parsed"):
+        transfer_manager._adaptive_parsed = parse_adaptive_config(cfg)
+    (
+        adaptive_enabled,
+        adaptive_min,
+        adaptive_margin,
+        adaptive_divisor,
+        adaptive_delta_min,
+    ) = transfer_manager._adaptive_parsed
+
+    if adaptive_enabled:
+        _adaptive_states = getattr(transfer_manager, "_adaptive_states", None)
+        if _adaptive_states is None:
+            _adaptive_states = {}
+            transfer_manager._adaptive_states = _adaptive_states
+
+        ctrl = _adaptive_states.get(req_id)
+        chunk_index = int(transfer_manager.ramp_chunk_count.get(req_id, 0))
+
+        if ctrl is None or chunk_index == 0:
+            # Chunk 0: use IC/steady threshold (same as original logic).
+            if pending <= 0:
+                if is_finished:
+                    transfer_manager.code_prompt_token_ids.pop(req_id, None)
+                    transfer_manager.request_payload.pop(req_id, None)
+                    return OmniPayloadStruct(
+                        codes=CodesStruct(audio=torch.empty(0, dtype=torch.long)),
+                        meta=MetaStruct(
+                            req_id=[req_id],
+                            left_context_size=0,
+                            codec_chunk_frames=0,
+                            codec_left_context_frames=0,
+                            stream_finished=torch.tensor(True, dtype=torch.bool),
+                            finished=torch.tensor(True, dtype=torch.bool),
+                        ),
+                        request_id=req_id,
+                    )
+                return None
+            if not is_finished and pending < threshold:
+                return None
+            emit_frames = pending if is_finished else threshold
+            target_size = emit_frames
+
+            now = time.monotonic()
+            ctrl = AdaptiveChunkController(
+                first_emit_time=now,
+                last_emit_time=now,
+                ramp_divisor=adaptive_divisor,
+                ramp_delta_min=adaptive_delta_min,
+            )
+            _adaptive_states[req_id] = ctrl
+        else:
+            now = time.monotonic()
+            target_size = ctrl.compute_next_chunk_size(
+                now,
+                adaptive_min,
+                chunk_frames,
+                adaptive_margin,
+            )
+            emit, emit_frames = compute_adaptive_emit(
+                pending,
+                0,
+                target_size,
+                is_finished,
+            )
+            if not emit:
+                return None
+            if emit_frames == 0:
+                ctrl.log_summary(req_id)
+                transfer_manager.code_prompt_token_ids.pop(req_id, None)
+                transfer_manager.request_payload.pop(req_id, None)
+                return OmniPayloadStruct(
+                    codes=CodesStruct(audio=torch.empty(0, dtype=torch.long)),
+                    meta=MetaStruct(
+                        req_id=[req_id],
+                        left_context_size=0,
+                        codec_chunk_frames=0,
+                        codec_left_context_frames=0,
+                        stream_finished=torch.tensor(True, dtype=torch.bool),
+                        finished=torch.tensor(True, dtype=torch.bool),
+                    ),
+                    request_id=req_id,
+                )
+
+        # Common emit path for adaptive.
+        actual_emit = min(emit_frames, pending)
+        chunk_rows = pending_frames[:actual_emit]
+        del pending_frames[:actual_emit]
+        chunk_np = np.stack([np.asarray(row, dtype=np.int64) for row in chunk_rows])
+        finished = bool(is_finished and len(pending_frames) == 0)
+
+        ctrl.record_emit(time.monotonic(), actual_emit, 0, target_size)
+        if finished:
+            ctrl.log_summary(req_id)
+
+        codec_flat = torch.from_numpy(np.ascontiguousarray(chunk_np.T).reshape(-1))
+
+        if finished:
+            transfer_manager.code_prompt_token_ids.pop(req_id, None)
+            transfer_manager.request_payload.pop(req_id, None)
+
+        return OmniPayloadStruct(
+            codes=CodesStruct(audio=codec_flat),
+            meta=MetaStruct(
+                req_id=[req_id],
+                left_context_size=0,
+                codec_chunk_frames=int(chunk_np.shape[0]),
+                codec_left_context_frames=0,
+                code_flat_numel=int(codec_flat.numel()),
+                stream_finished=torch.tensor(finished, dtype=torch.bool),
+                finished=torch.tensor(finished, dtype=torch.bool),
+            ),
+            request_id=req_id,
+        )
+
+    # Static ramp override (only when adaptive is not enabled).
     if ramp is not None:
         # The ladder is indexed by the connector's segment-local counter, which
         # restarts at each segment boundary; put_req_chunk is request-global.
         ramp_index = int(transfer_manager.ramp_chunk_count.get(req_id, 0))
         threshold = ramp_chunk_size(ramp_index, ramp, chunk_frames)
+
     if pending <= 0:
         if is_finished:
             transfer_manager.code_prompt_token_ids.pop(req_id, None)

@@ -647,7 +647,24 @@ class _MossTTSAdapterBase(ARTTSAdapter):
         prompt: dict | None = None,
         request_id: str | None = None,
     ) -> list:
-        return apply_max_new_tokens(sampling_params_list, request)
+        sampling_params_list = apply_max_new_tokens(sampling_params_list, request)
+
+        # Shallow-copy stage 0 so the shared defaults stay immutable.
+        import copy
+
+        sampling_params_list = [copy.copy(params) for params in sampling_params_list]
+
+        # Propagate the deploy/YAML stage seed to tts_local_seed. The generic
+        # serving layer applies an explicit request.seed afterwards, so the
+        # request value still has higher precedence.
+        stage0_params = sampling_params_list[0]
+        default_seed = getattr(stage0_params, "seed", None)
+        if default_seed is not None:
+            if stage0_params.extra_args is None:
+                stage0_params.extra_args = {}
+            stage0_params.extra_args.setdefault("tts_local_seed", int(default_seed))
+
+        return sampling_params_list
 
 
 @register_tts_adapter
