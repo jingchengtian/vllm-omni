@@ -424,6 +424,13 @@ def apply_rope(
     returned tensors are **not** interchangeable between the two paths — callers
     must not mix NPU and non-NPU outputs.  Result is bf16-equivalent (max
     ``max_abs_diff <= 1 ULP``).  Falls back to the eager path on non-NPU.
+
+    When ``table`` is provided (precomputed by the parent ``Transformer.forward``
+    via ``rope_angles`` and shared across all layers within that block), the
+    per-layer cos/sin computation is skipped on both the NPU and the eager
+    path -- one computation per transformer block instead of one per layer
+    (~86 redundant dispatches removed for a 92-layer / 6-block decoder, ~15x
+    reduction per block on NPU).
     """
     if time_before_heads:
         B, T, H, D = q.shape
@@ -438,9 +445,13 @@ def apply_rope(
     if q.device.type == "npu":
         torch_npu = _get_torch_npu()
 
-        angles = _rope_angles(offset, B, T, D, max_period, time_before_heads, q.device, freqs_cache)
-        cos_d2 = torch.cos(angles)  # (..., 1, T, D//2)
-        sin_d2 = torch.sin(angles)
+        if table is not None:
+            # Precomputed by ``rope_angles`` for these offsets: same values.
+            cos_d2, sin_d2 = table
+        else:
+            angles = _rope_angles(offset, B, T, D, max_period, time_before_heads, q.device, freqs_cache)
+            cos_d2 = torch.cos(angles)  # (..., 1, T, D//2)
+            sin_d2 = torch.sin(angles)
         # neox cos/sin: cat([first_half, second_half]) -- each freq once per half.
         cos = torch.cat([cos_d2, cos_d2], dim=-1)  # (..., 1, T, D)
         sin = torch.cat([sin_d2, sin_d2], dim=-1)
