@@ -5,29 +5,34 @@ from vllm.logger import init_logger
 from vllm.v1.worker.workspace import init_workspace_manager
 
 from vllm_omni.platforms.npu.ascend_warmup_patch import apply_ascend_warmup_patch
+from vllm_omni.platforms import current_omni_platform
 from vllm_omni.platforms.npu.worker.base import OmniNPUWorkerBase
 from vllm_omni.platforms.npu.worker.npu_ar_model_runner import NPUARModelRunner
 from vllm_omni.worker.mixins import OmniWorkerMixin
 
 logger = init_logger(__name__)
 
-# Install at import time: this module is imported while the stage worker is
-# built, which is earlier than the ascend Triton kernel warmup (that runs
-# after load_model in the same process). The guard resolves the SoC per call,
-# so installing this early is safe -- the probe only has to be right when a
-# warmup actually runs.
-apply_ascend_warmup_patch()
-
 
 class NPUARWorker(OmniWorkerMixin, OmniNPUWorkerBase):
-    """NPU AR worker for thinker/talker stages in Omni model."""
+    """NPU worker for autoregressive stages in Omni."""
 
     model_runner_cls = NPUARModelRunner
 
     def init_device(self):
-        self.device = self._init_device()
+        if not hasattr(self, "device") or self.device is None:
+            self.device = self._init_device()
+        # activate ascend warmup patch before model initialization
+        apply_ascend_warmup_patch()
+        # Initialize workspace manager after device setup (following vllm-ascend pattern)
         num_ubatches = 1
         init_workspace_manager(self.device, num_ubatches)
+
+        # Install platform-specific AR runtime patches (e.g. the MOSS-TTS
+        # depth whole-loop NPUGraph adapter) before model loading. MOSS stage 0
+        # runs on this worker, whose init_device inherits vllm-ascend's
+        # _init_device and never reaches NPUOmniPlatform.set_device, so this
+        # is the guaranteed AR startup path for such registration.
+        current_omni_platform.init_ar_worker_runtime(self.vllm_config, self.device)
 
         if self.use_v2_model_runner:
             from vllm_omni.platforms.npu.worker.npu_omni_v2_model_runner import NPUOmniARModelRunner
