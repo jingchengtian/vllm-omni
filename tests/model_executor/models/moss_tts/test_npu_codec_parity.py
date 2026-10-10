@@ -37,7 +37,7 @@ from vllm_omni.model_executor.models.moss_tts.audio_tokenizer_v2 import (
     apply_rope,
 )
 
-pytestmark = [pytest.mark.core_model, pytest.mark.tts]
+pytestmark = [pytest.mark.core_model, pytest.mark.tts, pytest.mark.npu]
 
 
 def _npu_available() -> bool:
