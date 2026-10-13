@@ -118,11 +118,10 @@ class _MossTTSLocalAttention(nn.Module):
     ) -> torch.Tensor:
         """Run a causal prefix, or one new token using frame-local K/V.
 
-        When ``attn_mask`` is provided (NPUGraph path), the full ``kv_cache``
-        tensors are passed to SDPA as-is with the mask zeroing positions
-        ``[position+1, n_vq)`` -- fixed shapes for graph capture. Without
-        ``attn_mask`` (eager path), a dynamic slice ``[:position+1]`` is
-        used instead.
+        With ``attn_mask`` (NPUGraph path) the full ``kv_cache`` is passed to
+        SDPA as-is and the mask zeroes positions ``[position+1, n_vq)`` for
+        fixed shapes; without it (eager) a dynamic ``[:position+1]`` slice is
+        used.
         """
         batch_size, seq_len, _ = hidden_states.shape
         qkv = self.c_attn(hidden_states)
