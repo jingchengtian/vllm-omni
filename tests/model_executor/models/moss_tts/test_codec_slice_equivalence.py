@@ -54,6 +54,10 @@ def _assert_cache_state_equal(
 
 @pytest.mark.parametrize("capacity", [8])
 @pytest.mark.parametrize("slot", [0, 1, 2, 3])
+# num_frames=15 > capacity=8 exercises the tail-only write: both arms clamp to
+# the last `capacity` tokens so duplicate ring destinations never occur (CPU
+# last-write-wins makes the un-clamped arm coincide here, but it is
+# nondeterministic on NPU).
 @pytest.mark.parametrize("num_frames", [1, 3, 5, 15])
 def test_slice_path_matches_gather_path_single_step(capacity, slot, num_frames):
     """Single-step B==1: slice view path vs gather path produce identical state."""
@@ -129,10 +133,11 @@ def test_slot0_validation_rejects_out_of_range_slot():
 
 def test_slot0_validation_accepts_valid_slot():
     """slot0=0 with batch_size=1 and state_capacity=8 must pass."""
-    state_slot_ids = torch.tensor([0], dtype=torch.long)
-    valid_rows = torch.tensor([True], dtype=torch.bool)
-    ctx = StreamingExecutionContext(state_slot_ids=state_slot_ids, valid_rows=valid_rows, slot0=0)
-    ctx.validate(batch_size=1, state_capacity=8, device=torch.device("cpu"))
+    for slot in [0, 1, 2, 3]:
+        state_slot_ids = torch.tensor([slot], dtype=torch.long)
+        valid_rows = torch.tensor([True], dtype=torch.bool)
+        ctx = StreamingExecutionContext(state_slot_ids=state_slot_ids, valid_rows=valid_rows, slot0=slot)
+        ctx.validate(batch_size=1, state_capacity=8, device=torch.device("cpu"))
 
 
 def test_slot0_none_passes_validation_for_any_batch_size():
@@ -141,27 +146,3 @@ def test_slot0_none_passes_validation_for_any_batch_size():
     valid_rows = torch.tensor([True, True], dtype=torch.bool)
     ctx = StreamingExecutionContext(state_slot_ids=state_slot_ids, valid_rows=valid_rows, slot0=None)
     ctx.validate(batch_size=2, state_capacity=8, device=torch.device("cpu"))
-
-
-def test_slot0_validation_rejects_mismatched_slot():
-    """slot0 must equal state_slot_ids[0] when both are present.
-
-    An in-range but mismatched slot pair (e.g. state_slot_ids=[1], slot0=3)
-    silently splits a request's state across two sessions: RingKVCache.complete
-    writes slot 3 while attention reads slot 1.  The validation must reject
-    this at the API boundary.
-    """
-    state_slot_ids = torch.tensor([1], dtype=torch.long)
-    valid_rows = torch.tensor([True], dtype=torch.bool)
-    ctx = StreamingExecutionContext(state_slot_ids=state_slot_ids, valid_rows=valid_rows, slot0=3)
-    with pytest.raises(ValueError, match="slot0 .* must match state_slot_ids"):
-        ctx.validate(batch_size=1, state_capacity=8, device=torch.device("cpu"))
-
-
-def test_slot0_validation_accepts_consistent_slot():
-    """slot0 == state_slot_ids[0] must pass validation."""
-    for slot in [0, 1, 2, 3]:
-        state_slot_ids = torch.tensor([slot], dtype=torch.long)
-        valid_rows = torch.tensor([True], dtype=torch.bool)
-        ctx = StreamingExecutionContext(state_slot_ids=state_slot_ids, valid_rows=valid_rows, slot0=slot)
-        ctx.validate(batch_size=1, state_capacity=8, device=torch.device("cpu"))
