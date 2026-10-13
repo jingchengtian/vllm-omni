@@ -14,7 +14,6 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 from typing import cast
-from unittest.mock import patch
 
 import pytest
 import torch
@@ -711,7 +710,11 @@ class TestPatchedGenerateFrameDispatch:
                     return self
 
             gen = torch.Generator()
-            with torch.inference_mode(), patch.object(torch.npu, "is_current_stream_capturing", return_value=False):
+            # torch.npu is absent on CPU-only installs, so install a minimal
+            # namespace before the dispatch gate reads it (same pattern as
+            # tests/platforms/npu/test_graph_tools.py).
+            monkeypatch.setattr(torch, "npu", SimpleNamespace(is_current_stream_capturing=lambda: False), raising=False)
+            with torch.inference_mode():
                 adapter._patched_generate_frame(
                     model, _FakeHidden(), heads, embs, text_head, n_vq=n_vq, do_sample=False, generators=[gen]
                 )
@@ -785,7 +788,8 @@ class TestPatchedGenerateFrameDispatch:
                 def to(self, dtype):
                     return self
 
-            with torch.inference_mode(), patch.object(torch.npu, "is_current_stream_capturing", return_value=False):
+            monkeypatch.setattr(torch, "npu", SimpleNamespace(is_current_stream_capturing=lambda: False), raising=False)
+            with torch.inference_mode():
                 monkeypatch.setattr(model.h[0].attn, "prepare_rope_cache", lambda *a, **k: None)
                 adapter._patched_generate_frame(model, _FakeHidden(), heads, embs, text_head, n_vq=n_vq, do_sample=True)
             assert seen == ["depth_whole_loop"]
@@ -793,23 +797,18 @@ class TestPatchedGenerateFrameDispatch:
             del adapter._depth_graph_runners[model]
 
     def test_max_graph_batch_default_is_sixteen(self):
-        """The default gate is B<=16: the range where the graph wins in both modes.
+        """The default gate is B<=16, the range where the graph wins in both modes.
 
-        Measured on Ascend 910B2C (this branch, in-process A/B, no RNG, 8 warm
-        groups of median-of-30, seed fixed): greedy 1.42x/1.16x/1.11x at
-        B=1/8/16 then 1.02x/1.01x/1.00x/0.97x/0.98x at B=20/24/32/48/64;
-        sampling 1.65x/1.27x/1.28x at B=1/8/16 then 1.08x/0.99x/0.99x/0.91x/
-        0.92x at B=20/24/32/48/64. The sampling crossover is the earlier of the
-        two and is the path real requests take, so gate at the largest batch
-        that still wins in both; past it the paths are at parity and the graph
-        would only add fixed-shape capture and its extra buffers. Raise it with
-        MOSS_TTS_LOCAL_DEPTH_GRAPH_MAX_BATCH.
+        The sampling crossover is earlier than greedy and is the path real
+        requests take; past B=16 the paths are at parity. Raise it with
+        MOSS_TTS_LOCAL_DEPTH_GRAPH_MAX_BATCH. Measured A/B table in the PR
+        description.
         """
         assert adapter._MAX_GRAPH_BATCH == 16
 
 
 # ---------------------------------------------------------------------------
-# AR worker startup registration (Fix A: patch wired into the AR init path)
+# AR worker startup registration
 # ---------------------------------------------------------------------------
 
 
