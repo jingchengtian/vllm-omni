@@ -35,6 +35,9 @@ logger = init_logger(__name__)
 MOSS_TTS_EFFECTIVE_MAX_TOKENS_KEY = "_moss_tts_effective_max_tokens"
 _MIN_CODEC_FRAMES = 192
 _MAX_CODEC_FRAMES_PER_TEXT_TOKEN = 12
+# MOSS-SoundEffect emits ~12.5 codec frames per second; ``tokens`` in the
+# build_user_message payload is the target frame count for the requested audio.
+_SOUND_EFFECT_FRAMES_PER_SECOND = 12.5
 
 
 class MossTTSCodecLimitError(TTSGenerationError):
@@ -504,7 +507,7 @@ class _MossTTSAdapterBase(ARTTSAdapter):
             user_kwargs["text"] = request.input or ""  # may be empty
             user_kwargs["ambient_sound"] = request.ambient_sound or ""
             if request.duration_seconds is not None:
-                user_kwargs["tokens"] = max(1, int(float(request.duration_seconds) * 12.5))
+                user_kwargs["tokens"] = max(1, int(float(request.duration_seconds) * _SOUND_EFFECT_FRAMES_PER_SECOND))
             elif request.max_new_tokens is not None:
                 user_kwargs["tokens"] = int(request.max_new_tokens)
         elif v == "voice_generator":
@@ -689,6 +692,15 @@ class _MossTTSAdapterBase(ARTTSAdapter):
         Mirrors the Qwen3-TTS pattern: ``dynamic_cap = max(192, text_tokens × 12)``,
         clamped to the configured ``max_tokens``.
 
+        An explicit ``duration_seconds`` (SoundEffect) is *not* a text-scaled
+        estimate: it pins a target audio length. SoundEffect generates 16
+        delayed codebooks and then audio-end + EOS termination, so honoring the
+        duration costs more scheduler steps than the requested frame count
+        (``duration × 12.5``) alone. A cap sized to the frame count would end
+        with ``length`` before the requested audio completes and be retried
+        with the same insufficient budget. For these requests the configured
+        server budget is preserved instead of truncating them.
+
         Nano (``_moss_variant is None``) is excluded: its outer scheduler
         steps represent audio chunks, not codec frames, and the frame count
         is controlled via ``additional_information["max_new_frames"]``
@@ -718,19 +730,17 @@ class _MossTTSAdapterBase(ARTTSAdapter):
         if request.max_new_tokens is not None:
             # An explicit request budget is an opt-out from the dynamic ceiling.
             effective_cap = int(request.max_new_tokens)
+        elif self._moss_variant == "sound_effect" and request.duration_seconds is not None:
+            # A pinned duration is not a text-scaled estimate, and the frame
+            # count alone underbudgets the scheduler steps (16 delayed codebooks
+            # + audio-end + EOS). Preserve the configured server budget so the
+            # requested audio can complete and terminate, rather than truncate
+            # it at ``duration × 12.5`` frames and retry with the same cap.
+            effective_cap = int(configured_cap) if configured_cap is not None else None
         else:
             text_tokens = self.ctx.server._count_usage_text_tokens(request.input)
             if text_tokens > 0:
                 dynamic_cap = max(_MIN_CODEC_FRAMES, text_tokens * _MAX_CODEC_FRAMES_PER_TEXT_TOKEN)
-
-                # SoundEffect: an explicit duration_seconds requests a specific
-                # number of frames (12.5 frames/sec). The dynamic cap must not
-                # truncate that — otherwise the generation ends with "length"
-                # and retries with the same cap, burning a decode slot.
-                if self._moss_variant == "sound_effect" and getattr(request, "duration_seconds", None) is not None:
-                    duration_tokens = max(1, int(float(request.duration_seconds) * 12.5))
-                    dynamic_cap = max(dynamic_cap, duration_tokens)
-
                 effective_cap = min(dynamic_cap, int(configured_cap)) if configured_cap is not None else dynamic_cap
             else:
                 # Token counting is best-effort. If the tokenizer is missing or
