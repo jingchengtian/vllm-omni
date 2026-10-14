@@ -1115,7 +1115,6 @@ def test_qwen3_tts_rejects_only_length_finished_base_audio(mocker):
         adapter.validate_generation(params, stage0_finish_reason="length", output_tokens=191)
 
 
-<<<<<<< HEAD
 @pytest.mark.parametrize("architecture", ["Ming3TTSForConditionalGeneration", "LingV3TTSForConditionalGeneration"])
 def test_detects_ming3_by_architecture(architecture):
     assert detect_tts_model_type("llm", architecture) == "ming3_tts"
@@ -1199,7 +1198,8 @@ def test_ming3_accepts_audio_backed_uploaded_voice(mocker):
     server._apply_uploaded_speaker.assert_called_once_with(request)
     assert request.ref_audio == "data:audio/wav;base64,AA=="
     assert request.ref_text == "Reference transcript."
-=======
+
+
 @pytest.mark.parametrize(
     ("text_tokens", "request_cap", "expected_cap"),
     [
@@ -1250,17 +1250,22 @@ def test_moss_tts_validate_generation_skips_without_cap_key(mocker):
     adapter.validate_generation(params, stage0_finish_reason="length", output_tokens=999)
 
 
-def test_moss_tts_sound_effect_duration_preserves_requested_frames(mocker):
-    """P1: SoundEffect duration_seconds must not be truncated by the dynamic cap.
+def test_moss_tts_sound_effect_duration_preserves_configured_budget(mocker):
+    """[important] An explicit duration_seconds must not be truncated by the cap.
 
-    duration_seconds=30 → 375 frames (30×12.5). With 10 text tokens the
-    text-scaled cap would be 192, but the duration request must win.
+    SoundEffect generates 16 delayed codebooks and then audio-end + EOS
+    termination, so honoring a requested duration costs more scheduler steps
+    than the requested frame count (duration × 12.5). A cap equal to the frame
+    count ends with ``length`` before the requested audio completes and is
+    retried with the same insufficient budget. The configured server budget
+    must be preserved and must cover the frames plus termination overhead.
     """
     server = mocker.Mock()
     server._count_usage_text_tokens.return_value = 10
     adapter = MossTTSAdapter(SpeechServingContext(server=server))
     adapter._moss_variant = "sound_effect"
-    stage_defaults = [SamplingParams(max_tokens=4096, min_tokens=2)]
+    configured_cap = 4096
+    stage_defaults = [SamplingParams(max_tokens=configured_cap, min_tokens=2)]
     request = OpenAICreateSpeechRequest(
         input="boom",
         duration_seconds=30,
@@ -1269,9 +1274,20 @@ def test_moss_tts_sound_effect_duration_preserves_requested_frames(mocker):
 
     overridden = adapter.apply_sampling_overrides(stage_defaults, request, prompt)
 
-    # 375 = max(192, 10*12=120) → max(192, 375) = 375
-    assert overridden[0].max_tokens == 375
-    assert prompt["additional_information"][MOSS_TTS_EFFECTIVE_MAX_TOKENS_KEY] == [375]
+    duration_frames = 375  # 30 s × 12.5 frames/s
+    # Conservative lower bound: n_vq (16) delayed codebooks + audio-end + EOS.
+    termination_overhead = 16 + 2
+
+    # The configured budget wins over both the frame count and the text-scaled
+    # cap (max(192, 10 × 12) = 192).
+    assert overridden[0].max_tokens == configured_cap
+    assert prompt["additional_information"][MOSS_TTS_EFFECTIVE_MAX_TOKENS_KEY] == [configured_cap]
+    # Completion + termination must fit: the budget covers the requested frames
+    # plus the delay/termination overhead, so generation can reach EOS.
+    assert overridden[0].max_tokens >= duration_frames + termination_overhead
+    # A frame-count-sized cap would have underbudgeted the request.
+    assert overridden[0].max_tokens > duration_frames
+    assert stage_defaults[0].max_tokens == configured_cap
 
 
 def test_moss_tts_sound_effect_no_duration_uses_text_cap(mocker):
@@ -1328,7 +1344,6 @@ def test_moss_tts_seed_does_not_mutate_shared_defaults(mocker):
     # The shared defaults dict must not be mutated
     assert "tts_local_seed" not in shared_extra_args
     assert shared_extra_args == {"custom_arg": 1}
->>>>>>> f124b94ca ([Feature][TTS] Add text-scaled dynamic codec token budget for MOSS-TTS)
 
 
 def test_indextts_adapters_are_versioned():
