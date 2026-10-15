@@ -21,7 +21,7 @@ from vllm_omni.worker_v2.model_states.eager_mtp import EagerMTPState
 from vllm_omni.worker_v2.model_states.intermediate_buffer import OmniIntermediateBuffer
 from vllm_omni.worker_v2.model_states.omni_model_state import OmniModelState
 
-pytestmark = [pytest.mark.core_model, *hardware_marks(res={"npu": "A3"}, num_cards=1)]
+pytestmark = [pytest.mark.core_model]
 
 
 def _npu_available() -> bool:
@@ -33,7 +33,7 @@ def _npu_available() -> bool:
 
 
 npu_only = pytest.mark.skipif(not _npu_available(), reason="NPU device or torch_npu not available.")
-npu_device = pytest.param("npu", marks=npu_only)
+npu_device = pytest.param("npu", marks=[npu_only, *hardware_marks(res={"npu": "A3"}, num_cards=1)])
 
 
 @pytest.fixture(
