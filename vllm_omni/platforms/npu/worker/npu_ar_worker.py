@@ -4,8 +4,8 @@
 from vllm.logger import init_logger
 from vllm.v1.worker.workspace import init_workspace_manager
 
-from vllm_omni.platforms.npu.ascend_warmup_patch import apply_ascend_warmup_patch
 from vllm_omni.platforms import current_omni_platform
+from vllm_omni.platforms.npu.ascend_warmup_patch import apply_ascend_warmup_patch
 from vllm_omni.platforms.npu.worker.base import OmniNPUWorkerBase
 from vllm_omni.platforms.npu.worker.npu_ar_model_runner import NPUARModelRunner
 from vllm_omni.worker.mixins import OmniWorkerMixin
