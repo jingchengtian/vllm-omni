@@ -34,6 +34,7 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 MOSS_TTS_EFFECTIVE_MAX_TOKENS_KEY = "_moss_tts_effective_max_tokens"
+MOSS_TTS_AUTO_BUDGET_KEY = "_moss_tts_auto_budget"
 _MIN_CODEC_FRAMES = 192
 _MAX_CODEC_FRAMES_PER_TEXT_TOKEN = 12
 # MOSS-SoundEffect emits ~12.5 codec frames per second; ``tokens`` in the
@@ -748,9 +749,12 @@ class _MossTTSAdapterBase(ARTTSAdapter):
 
         configured_cap = getattr(stage0_params, "max_tokens", None)
         effective_cap: int | None
+        auto_budget = False
 
         if request.max_new_tokens is not None:
             # An explicit request budget is an opt-out from the dynamic ceiling.
+            # A length finish under a caller budget returns the audio, matching
+            # the Qwen3-TTS contract for explicit max_new_tokens.
             effective_cap = int(request.max_new_tokens)
         elif self._moss_variant == "sound_effect" and request.duration_seconds is not None:
             # A pinned duration is not a text-scaled estimate, and the frame
@@ -764,6 +768,7 @@ class _MossTTSAdapterBase(ARTTSAdapter):
             if text_tokens > 0:
                 dynamic_cap = max(_MIN_CODEC_FRAMES, text_tokens * _MAX_CODEC_FRAMES_PER_TEXT_TOKEN)
                 effective_cap = min(dynamic_cap, int(configured_cap)) if configured_cap is not None else dynamic_cap
+                auto_budget = True
             else:
                 # Token counting is best-effort. If the tokenizer is missing or
                 # rejects the input, preserve the configured budget instead of
@@ -782,6 +787,8 @@ class _MossTTSAdapterBase(ARTTSAdapter):
             additional_information = prompt.get("additional_information")
             if isinstance(additional_information, dict) and effective_cap is not None:
                 additional_information[MOSS_TTS_EFFECTIVE_MAX_TOKENS_KEY] = [effective_cap]
+                if auto_budget:
+                    additional_information[MOSS_TTS_AUTO_BUDGET_KEY] = [True]
 
         _propagate_seed(stage0_params)
 
@@ -806,6 +813,12 @@ class _MossTTSAdapterBase(ARTTSAdapter):
         without producing codec EOS — the audio is incomplete and likely
         degenerate (repetitive sampling). Surface it as a retryable error so
         the client can retry with a fresh sampling seed.
+
+        Only the server-derived text-scaled budget (``MOSS_TTS_AUTO_BUDGET_KEY``)
+        is rejected on a length finish. An explicit caller ``max_new_tokens``
+        (or a pinned ``duration_seconds``) is the caller's own budget, so a
+        length finish returns the generated audio unchanged — matching the
+        Qwen3-TTS contract for explicit caller budgets.
         """
         from collections.abc import Mapping
 
@@ -814,6 +827,13 @@ class _MossTTSAdapterBase(ARTTSAdapter):
         if MOSS_TTS_EFFECTIVE_MAX_TOKENS_KEY not in tts_params:
             return
         if stage0_finish_reason != "length":
+            return
+        # An explicit caller budget keeps returning the audio; only the
+        # server-derived text-scaled cap is rejected as a degenerate generation.
+        auto_budget = tts_params.get(MOSS_TTS_AUTO_BUDGET_KEY)
+        if isinstance(auto_budget, (list, tuple)):
+            auto_budget = auto_budget[0] if auto_budget else None
+        if not auto_budget:
             return
 
         raw_limit = tts_params.get(MOSS_TTS_EFFECTIVE_MAX_TOKENS_KEY)

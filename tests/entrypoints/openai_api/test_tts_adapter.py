@@ -49,6 +49,7 @@ from vllm_omni.entrypoints.openai.tts_adapters.ming3_audio_tts import Ming3Audio
 from vllm_omni.entrypoints.openai.tts_adapters.ming3_tts import Ming3TTSAdapter
 from vllm_omni.entrypoints.openai.tts_adapters.ming_flash_omni_tts import MingFlashOmniTTSAdapter
 from vllm_omni.entrypoints.openai.tts_adapters.moss_tts import (
+    MOSS_TTS_AUTO_BUDGET_KEY,
     MOSS_TTS_EFFECTIVE_MAX_TOKENS_KEY,
     MossTTSAdapter,
     MossTTSCodecLimitError,
@@ -1226,6 +1227,12 @@ def test_moss_tts_applies_text_scaled_codec_safety_limit(text_tokens, request_ca
 
     assert overridden[0].max_tokens == expected_cap
     assert prompt["additional_information"][MOSS_TTS_EFFECTIVE_MAX_TOKENS_KEY] == [expected_cap]
+    # The auto budget flag is set only for the text-scaled path (no explicit
+    # request cap); an explicit max_new_tokens is the caller's own budget.
+    if request_cap is None and text_tokens > 0:
+        assert prompt["additional_information"][MOSS_TTS_AUTO_BUDGET_KEY] == [True]
+    else:
+        assert MOSS_TTS_AUTO_BUDGET_KEY not in prompt["additional_information"]
     assert stage_defaults[0].max_tokens == 4096
 
 
@@ -1233,6 +1240,7 @@ def test_moss_tts_rejects_length_finished_generation(mocker):
     adapter = MossTTSAdapter(SpeechServingContext(server=mocker.Mock()))
     params = {
         MOSS_TTS_EFFECTIVE_MAX_TOKENS_KEY: [192],
+        MOSS_TTS_AUTO_BUDGET_KEY: [True],
     }
 
     # Normal finish (EOS / stop) is valid.
@@ -1242,6 +1250,26 @@ def test_moss_tts_rejects_length_finished_generation(mocker):
     # Length-finished means the budget was exhausted without EOS.
     with pytest.raises(MossTTSCodecLimitError, match="191/192"):
         adapter.validate_generation(params, stage0_finish_reason="length", output_tokens=191)
+
+
+def test_moss_tts_explicit_budget_returns_audio_on_length_finish(mocker):
+    """An explicit caller max_new_tokens is the caller's own budget.
+
+    A length finish under it must return the generated audio, matching the
+    Qwen3-TTS contract for explicit caller budgets.
+    """
+    adapter = MossTTSAdapter(SpeechServingContext(server=mocker.Mock()))
+    params = {
+        MOSS_TTS_EFFECTIVE_MAX_TOKENS_KEY: [256],
+    }
+
+    # No auto budget key → length finish returns audio (no raise).
+    adapter.validate_generation(params, stage0_finish_reason="length", output_tokens=256)
+    adapter.validate_generation(params, stage0_finish_reason="stop", output_tokens=256)
+
+    # Explicitly False auto budget also returns audio.
+    params[MOSS_TTS_AUTO_BUDGET_KEY] = [False]
+    adapter.validate_generation(params, stage0_finish_reason="length", output_tokens=256)
 
 
 def test_moss_tts_validate_generation_skips_without_cap_key(mocker):
@@ -1282,6 +1310,8 @@ def test_moss_tts_sound_effect_duration_preserves_configured_budget(mocker):
     # cap (max(192, 10 × 12) = 192).
     assert overridden[0].max_tokens == configured_cap
     assert prompt["additional_information"][MOSS_TTS_EFFECTIVE_MAX_TOKENS_KEY] == [configured_cap]
+    # A pinned duration is the caller's own budget, not a server-derived cap.
+    assert MOSS_TTS_AUTO_BUDGET_KEY not in prompt["additional_information"]
     # Completion + termination must fit: the budget covers the requested frames
     # plus the delay/termination overhead, so generation can reach EOS.
     assert overridden[0].max_tokens >= duration_frames + termination_overhead
@@ -1304,6 +1334,7 @@ def test_moss_tts_sound_effect_no_duration_uses_text_cap(mocker):
 
     # No duration → text-scaled: max(192, 10*12=120) = 192
     assert overridden[0].max_tokens == 192
+    assert prompt["additional_information"][MOSS_TTS_AUTO_BUDGET_KEY] == [True]
 
 
 def test_moss_tts_nano_excluded_from_dynamic_cap(mocker):
